@@ -1,0 +1,63 @@
+{
+  "name": "mimiciv-data-extraction",
+  "version": "1.0.0",
+  "description": "Comprehensive MIMIC-IV database analysis skill focused on raw data extraction, SQL queries, and clinical concepts including SOFA scores, sepsis, AKI, and ICU analytics",
+  "author": "Claude AI",
+  "created": "2025-11-14",
+  "tags": [
+    "mimic-iv",
+    "medical-data",
+    "sql",
+    "postgresql",
+    "clinical-research",
+    "icu",
+    "sepsis",
+    "sofa-score",
+    "aki",
+    "data-extraction",
+    "healthcare",
+    "critical-care"
+  ],
+  "categories": [
+    "Database Schema",
+    "Data Extraction",
+    "SQL Queries",
+    "Clinical Concepts",
+    "Table Relationships"
+  ],
+  "focus_areas": [
+    "Raw data extraction from MIMIC-IV tables",
+    "Understanding table schemas and relationships",
+    "SQL query patterns for clinical research",
+    "SOFA score calculation",
+    "Sepsis and AKI identification",
+    "ICU patient data analysis"
+  ],
+  "data_sources": [
+    {
+      "type": "documentation",
+      "url": "https://mimic.mit.edu/docs/iv/",
+      "name": "MIMIC-IV Official Documentation"
+    },
+    {
+      "type": "github",
+      "url": "https://github.com/MIT-LCP/mimic-code",
+      "name": "MIMIC Code Repository"
+    }
+  ],
+  "key_modules": [
+    "hosp - Hospital EHR data",
+    "icu - Intensive Care Unit events",
+    "ed - Emergency Department data",
+    "cxr - Chest X-ray metadata"
+  ],
+  "common_use_cases": [
+    "Building patient cohorts for research",
+    "Extracting time-series vital signs",
+    "Calculating clinical scores (SOFA, SAPS, APACHE)",
+    "Identifying sepsis patients",
+    "Detecting acute kidney injury",
+    "Analyzing medication exposures",
+    "Laboratory value extraction with reference ranges"
+  ]
+}

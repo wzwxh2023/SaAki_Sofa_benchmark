@@ -1,0 +1,49 @@
+{
+  "name": "mimiciv-analysis",
+  "sources": [
+    {
+      "type": "documentation",
+      "url": "https://mimic.mit.edu/docs/iv/",
+      "name": "MIMIC-IV Documentation",
+      "max_depth": 3,
+      "include_patterns": [
+        "*/modules/*",
+        "*/tables/*",
+        "*/concepts/*",
+        "*/about/*"
+      ]
+    },
+    {
+      "type": "github",
+      "repo": "MIT-LCP/mimic-code",
+      "name": "MIMIC-IV Code Repository",
+      "include_readme": true,
+      "include_docs": true,
+      "include_code": true,
+      "file_extensions": [".sql", ".py", ".md"],
+      "include_folders": [
+        "mimic-iv",
+        "mimic-iv/concepts",
+        "mimic-iv/buildmimic/postgres"
+      ]
+    }
+  ],
+  "skill_config": {
+    "description": "Comprehensive MIMIC-IV database analysis skill focused on raw data extraction, SQL queries, and clinical concepts including SOFA scores, sepsis, AKI, and ICU analytics.",
+    "categories": [
+      "Database Schema",
+      "Data Extraction",
+      "SQL Queries",
+      "Clinical Concepts",
+      "Table Relationships"
+    ],
+    "focus_areas": [
+      "Raw data extraction from MIMIC-IV tables",
+      "Understanding table schemas and relationships",
+      "SQL query patterns for clinical research",
+      "SOFA score calculation",
+      "Sepsis and AKI identification",
+      "ICU patient data analysis"
+    ]
+  }
+}
