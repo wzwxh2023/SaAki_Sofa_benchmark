@@ -1,0 +1,581 @@
+-- ------------------------------------------------------------------
+-- Title: Sequential Organ Failure Assessment (SOFA-2)
+-- Description: SOFA-2 score calculation for **every hour** of ICU stay
+--
+-- This is the updated SOFA score based on JAMA 2025 publication:
+-- Ranzani OT, Singer M, Salluh JIF, et al.
+-- Development and Validation of the Sequential Organ Failure Assessment (SOFA)-2 Score.
+-- JAMA. 2025. doi:10.1001/jama.2025.20516
+--
+-- Key updates from SOFA-1:
+-- 1. Brain: Added delirium medication consideration
+-- 2. Respiratory: New PF thresholds + advanced respiratory support
+-- 3. Cardiovascular: Combined NE+Epi dosing + mechanical support
+-- 4. Liver: Minor threshold adjustment (< to ≤)
+-- 5. Kidney: Weight-based UO + RRT metabolic criteria
+-- 6. Hemostasis: New platelet thresholds (≤80 for 3pts, ≤50 for 4pts)
+--
+-- Note: Compatible with MIMIC-IV PostgreSQL schema
+-- For BigQuery, replace DATETIME_SUB with DATE_SUB and adjust syntax
+-- ------------------------------------------------------------------
+
+-- Use icustay_hourly to get a row for every hour in the ICU
+WITH co AS (
+    SELECT ih.stay_id, ie.hadm_id, ie.subject_id
+        , hr
+        -- start/endtime for this hour
+        , DATETIME_SUB(ih.endtime, INTERVAL '1' HOUR) AS starttime
+        , ih.endtime
+    FROM mimiciv_derived.icustay_hourly ih
+    INNER JOIN mimiciv_icu.icustays ie
+        ON ih.stay_id = ie.stay_id
+)
+
+-- =================================================================
+-- HELPER CTE: Get patient weight (needed for weight-based UO and vasopressor dosing)
+-- =================================================================
+, patient_weight AS (
+    SELECT
+        stay_id,
+        weight
+    FROM mimiciv_derived.first_day_weight
+    WHERE weight IS NOT NULL AND weight > 0
+)
+
+-- =================================================================
+-- HELPER CTE: Delirium medications
+-- =================================================================
+, delirium_meds AS (
+    SELECT DISTINCT
+        ie.stay_id,
+        pr.startdate,
+        pr.stopdate,
+        1 AS on_delirium_med
+    FROM mimiciv_icu.icustays ie
+    INNER JOIN mimiciv_hosp.prescriptions pr
+        ON ie.hadm_id = pr.hadm_id
+    WHERE (LOWER(pr.drug) LIKE '%haloperidol%'
+           OR LOWER(pr.drug) LIKE '%quetiapine%'
+           OR LOWER(pr.drug) LIKE '%olanzapine%'
+           OR LOWER(pr.drug) LIKE '%risperidone%'
+           OR LOWER(pr.drug) LIKE '%haldol%'
+           OR LOWER(pr.drug) LIKE '%seroquel%'
+           OR LOWER(pr.drug) LIKE '%zyprexa%'
+           OR LOWER(pr.drug) LIKE '%risperdal%')
+)
+
+-- =================================================================
+-- HELPER CTE: Advanced respiratory support
+-- =================================================================
+, advanced_resp_support AS (
+    SELECT
+        stay_id,
+        starttime,
+        endtime,
+        ventilation_status,
+        CASE
+            WHEN ventilation_status IN ('InvasiveVent', 'Tracheostomy') THEN 1
+            WHEN ventilation_status IN ('NonInvasiveVent', 'HFNC') THEN 1
+            ELSE 0
+        END AS has_advanced_support
+    FROM mimiciv_derived.ventilation
+    WHERE ventilation_status IN ('InvasiveVent', 'Tracheostomy', 'NonInvasiveVent', 'HFNC')
+)
+
+-- =================================================================
+-- HELPER CTE: Mechanical circulatory support
+-- (ECMO, IABP, LVAD, Impella)
+-- =================================================================
+, mechanical_support AS (
+    SELECT DISTINCT
+        stay_id,
+        charttime,
+        CASE
+            WHEN itemid IN (228001, 229270, 229272) THEN 'ECMO'
+            WHEN itemid IN (228000, 224797, 224798) THEN 'IABP'
+            ELSE 'Other'
+        END AS device_type,
+        1 AS has_mechanical_support
+    FROM mimiciv_icu.chartevents
+    WHERE itemid IN (228001, 229270, 229272, 228000, 224797, 224798)
+)
+
+-- =================================================================
+-- HELPER CTE: RRT detection
+-- =================================================================
+, rrt_active AS (
+    SELECT
+        stay_id,
+        charttime,
+        dialysis_active AS on_rrt
+    FROM mimiciv_derived.rrt
+    WHERE dialysis_active = 1
+)
+
+-- =================================================================
+-- SECTION 1: BRAIN/NEUROLOGICAL
+-- =================================================================
+, gcs AS (
+    SELECT co.stay_id, co.hr
+        , MIN(gcs.gcs) AS gcs_min
+    FROM co
+    LEFT JOIN mimiciv_derived.gcs gcs
+        ON co.stay_id = gcs.stay_id
+            AND co.starttime < gcs.charttime
+            AND co.endtime >= gcs.charttime
+    GROUP BY co.stay_id, co.hr
+)
+
+, brain_delirium AS (
+    SELECT
+        co.stay_id,
+        co.hr,
+        MAX(CASE
+            WHEN dm.on_delirium_med = 1
+                 AND CAST(co.starttime AS DATE) >= dm.startdate
+                 AND CAST(co.starttime AS DATE) <= COALESCE(dm.stopdate, CAST(co.starttime AS DATE) + INTERVAL '1' DAY)
+            THEN 1
+            ELSE 0
+        END) AS on_delirium_med
+    FROM co
+    LEFT JOIN delirium_meds dm
+        ON co.stay_id = dm.stay_id
+    GROUP BY co.stay_id, co.hr
+)
+
+-- =================================================================
+-- SECTION 2: RESPIRATORY
+-- =================================================================
+, pafi AS (
+    -- PaO2/FiO2 ratio with advanced respiratory support flag
+    SELECT ie.stay_id
+        , bg.charttime
+        -- Check if on advanced respiratory support during this blood gas
+        , CASE
+            WHEN ars.stay_id IS NOT NULL THEN 1
+            ELSE 0
+        END AS on_advanced_support
+        , bg.pao2fio2ratio
+    FROM mimiciv_icu.icustays ie
+    INNER JOIN mimiciv_derived.bg bg
+        ON ie.subject_id = bg.subject_id
+        AND bg.specimen = 'ART.'
+    LEFT JOIN advanced_resp_support ars
+        ON ie.stay_id = ars.stay_id
+            AND bg.charttime >= ars.starttime
+            AND bg.charttime <= ars.endtime
+)
+
+, pf AS (
+    SELECT co.stay_id, co.hr
+        -- Minimum PF ratio without advanced support
+        , MIN(CASE WHEN pafi.on_advanced_support = 0 THEN pafi.pao2fio2ratio END) AS pf_novent_min
+        -- Minimum PF ratio with advanced support
+        , MIN(CASE WHEN pafi.on_advanced_support = 1 THEN pafi.pao2fio2ratio END) AS pf_vent_min
+        -- Flag for any advanced support during this hour
+        , MAX(pafi.on_advanced_support) AS has_advanced_support
+    FROM co
+    LEFT JOIN pafi
+        ON co.stay_id = pafi.stay_id
+            AND co.starttime < pafi.charttime
+            AND co.endtime >= pafi.charttime
+    GROUP BY co.stay_id, co.hr
+)
+
+-- Check for ECMO (respiratory indication)
+, ecmo_resp AS (
+    SELECT
+        co.stay_id,
+        co.hr,
+        MAX(ms.has_mechanical_support) AS on_ecmo
+    FROM co
+    LEFT JOIN mechanical_support ms
+        ON co.stay_id = ms.stay_id
+            AND ms.device_type = 'ECMO'
+            AND co.starttime < ms.charttime
+            AND co.endtime >= ms.charttime
+    GROUP BY co.stay_id, co.hr
+)
+
+-- =================================================================
+-- SECTION 3: CARDIOVASCULAR
+-- =================================================================
+, vs AS (
+    SELECT co.stay_id, co.hr
+        , MIN(vs.mbp) AS mbp_min
+    FROM co
+    LEFT JOIN mimiciv_derived.vitalsign vs
+        ON co.stay_id = vs.stay_id
+            AND co.starttime < vs.charttime
+            AND co.endtime >= vs.charttime
+    GROUP BY co.stay_id, co.hr
+)
+
+-- Vasopressors with weight-based dosing
+, vaso AS (
+    SELECT
+        co.stay_id
+        , co.hr
+        -- Norepinephrine (mcg/kg/min)
+        , MAX(nor.vaso_rate / COALESCE(wt.weight, 80)) AS rate_norepinephrine
+        -- Epinephrine (mcg/kg/min)
+        , MAX(epi.vaso_rate / COALESCE(wt.weight, 80)) AS rate_epinephrine
+        -- Dopamine (mcg/kg/min)
+        , MAX(dop.vaso_rate / COALESCE(wt.weight, 80)) AS rate_dopamine
+        -- Dobutamine (mcg/kg/min)
+        , MAX(dob.vaso_rate / COALESCE(wt.weight, 80)) AS rate_dobutamine
+        -- TODO: Add vasopressin and phenylephrine if needed
+    FROM co
+    LEFT JOIN patient_weight wt
+        ON co.stay_id = wt.stay_id
+    LEFT JOIN mimiciv_derived.norepinephrine nor
+        ON co.stay_id = nor.stay_id
+            AND co.endtime > nor.starttime
+            AND co.endtime <= nor.endtime
+    LEFT JOIN mimiciv_derived.epinephrine epi
+        ON co.stay_id = epi.stay_id
+            AND co.endtime > epi.starttime
+            AND co.endtime <= epi.endtime
+    LEFT JOIN mimiciv_derived.dopamine dop
+        ON co.stay_id = dop.stay_id
+            AND co.endtime > dop.starttime
+            AND co.endtime <= dop.endtime
+    LEFT JOIN mimiciv_derived.dobutamine dob
+        ON co.stay_id = dob.stay_id
+            AND co.endtime > dob.starttime
+            AND co.endtime <= dob.endtime
+    WHERE nor.stay_id IS NOT NULL
+        OR epi.stay_id IS NOT NULL
+        OR dop.stay_id IS NOT NULL
+        OR dob.stay_id IS NOT NULL
+    GROUP BY co.stay_id, co.hr
+)
+
+, mech_support AS (
+    SELECT
+        co.stay_id,
+        co.hr,
+        MAX(ms.has_mechanical_support) AS has_mechanical_support
+    FROM co
+    LEFT JOIN mechanical_support ms
+        ON co.stay_id = ms.stay_id
+            AND co.starttime < ms.charttime
+            AND co.endtime >= ms.charttime
+    GROUP BY co.stay_id, co.hr
+)
+
+-- =================================================================
+-- SECTION 4: LIVER
+-- =================================================================
+, bili AS (
+    SELECT co.stay_id, co.hr
+        , MAX(enz.bilirubin_total) AS bilirubin_max
+    FROM co
+    LEFT JOIN mimiciv_derived.enzyme enz
+        ON co.hadm_id = enz.hadm_id
+            AND co.starttime < enz.charttime
+            AND co.endtime >= enz.charttime
+    GROUP BY co.stay_id, co.hr
+)
+
+-- =================================================================
+-- SECTION 5: KIDNEY
+-- =================================================================
+, cr AS (
+    SELECT co.stay_id, co.hr
+        , MAX(chem.creatinine) AS creatinine_max
+        , MAX(chem.potassium) AS potassium_max
+    FROM co
+    LEFT JOIN mimiciv_derived.chemistry chem
+        ON co.hadm_id = chem.hadm_id
+            AND co.starttime < chem.charttime
+            AND co.endtime >= chem.charttime
+    GROUP BY co.stay_id, co.hr
+)
+
+, bg_metabolic AS (
+    SELECT co.stay_id, co.hr
+        , MIN(bg.ph) AS ph_min
+        , MIN(bg.bicarbonate) AS bicarbonate_min
+    FROM co
+    LEFT JOIN mimiciv_derived.bg bg
+        ON co.subject_id = bg.subject_id
+            AND bg.specimen = 'ART.'
+            AND co.starttime < bg.charttime
+            AND co.endtime >= bg.charttime
+    GROUP BY co.stay_id, co.hr
+)
+
+, uo_weight AS (
+    SELECT co.stay_id, co.hr
+        -- Calculate weight-based urine output over 24h window
+        , MAX(
+            CASE WHEN uo.uo_tm_24hr >= 22 AND uo.uo_tm_24hr <= 30
+                THEN uo.urineoutput_24hr / COALESCE(wt.weight, 80) / 24  -- ml/kg/h
+            END) AS uo_ml_kg_h_24hr
+        -- For shorter windows, we'll approximate from 24h rate
+        -- Ideally should calculate 6h, 12h windows separately
+    FROM co
+    LEFT JOIN patient_weight wt
+        ON co.stay_id = wt.stay_id
+    LEFT JOIN mimiciv_derived.urine_output_rate uo
+        ON co.stay_id = uo.stay_id
+            AND co.starttime < uo.charttime
+            AND co.endtime >= uo.charttime
+    GROUP BY co.stay_id, co.hr
+)
+
+, rrt_status AS (
+    SELECT
+        co.stay_id,
+        co.hr,
+        MAX(rrt.on_rrt) AS on_rrt
+    FROM co
+    LEFT JOIN rrt_active rrt
+        ON co.stay_id = rrt.stay_id
+            AND co.starttime < rrt.charttime
+            AND co.endtime >= rrt.charttime
+    GROUP BY co.stay_id, co.hr
+)
+
+-- =================================================================
+-- SECTION 6: HEMOSTASIS (COAGULATION)
+-- =================================================================
+, plt AS (
+    SELECT co.stay_id, co.hr
+        , MIN(cbc.platelet) AS platelet_min
+    FROM co
+    LEFT JOIN mimiciv_derived.complete_blood_count cbc
+        ON co.hadm_id = cbc.hadm_id
+            AND co.starttime < cbc.charttime
+            AND co.endtime >= cbc.charttime
+    GROUP BY co.stay_id, co.hr
+)
+
+-- =================================================================
+-- COMBINE ALL COMPONENTS
+-- =================================================================
+, scorecomp AS (
+    SELECT
+        co.stay_id
+        , co.hr
+        , co.starttime, co.endtime
+        -- Brain/Neurological
+        , gcs.gcs_min
+        , bd.on_delirium_med
+        -- Respiratory
+        , pf.pf_novent_min
+        , pf.pf_vent_min
+        , pf.has_advanced_support
+        , ecmo.on_ecmo
+        -- Cardiovascular
+        , vs.mbp_min
+        , vaso.rate_norepinephrine
+        , vaso.rate_epinephrine
+        , vaso.rate_dopamine
+        , vaso.rate_dobutamine
+        , mech.has_mechanical_support
+        -- Liver
+        , bili.bilirubin_max
+        -- Kidney
+        , cr.creatinine_max
+        , cr.potassium_max
+        , bgm.ph_min
+        , bgm.bicarbonate_min
+        , uo.uo_ml_kg_h_24hr
+        , rrt.on_rrt
+        -- Hemostasis
+        , plt.platelet_min
+    FROM co
+    LEFT JOIN gcs
+        ON co.stay_id = gcs.stay_id AND co.hr = gcs.hr
+    LEFT JOIN brain_delirium bd
+        ON co.stay_id = bd.stay_id AND co.hr = bd.hr
+    LEFT JOIN pf
+        ON co.stay_id = pf.stay_id AND co.hr = pf.hr
+    LEFT JOIN ecmo_resp ecmo
+        ON co.stay_id = ecmo.stay_id AND co.hr = ecmo.hr
+    LEFT JOIN vs
+        ON co.stay_id = vs.stay_id AND co.hr = vs.hr
+    LEFT JOIN vaso
+        ON co.stay_id = vaso.stay_id AND co.hr = vaso.hr
+    LEFT JOIN mech_support mech
+        ON co.stay_id = mech.stay_id AND co.hr = mech.hr
+    LEFT JOIN bili
+        ON co.stay_id = bili.stay_id AND co.hr = bili.hr
+    LEFT JOIN cr
+        ON co.stay_id = cr.stay_id AND co.hr = cr.hr
+    LEFT JOIN bg_metabolic bgm
+        ON co.stay_id = bgm.stay_id AND co.hr = bgm.hr
+    LEFT JOIN uo_weight uo
+        ON co.stay_id = uo.stay_id AND co.hr = uo.hr
+    LEFT JOIN rrt_status rrt
+        ON co.stay_id = rrt.stay_id AND co.hr = rrt.hr
+    LEFT JOIN plt
+        ON co.stay_id = plt.stay_id AND co.hr = plt.hr
+)
+
+-- =================================================================
+-- CALCULATE SOFA-2 SCORES
+-- =================================================================
+, scorecalc AS (
+    SELECT scorecomp.*
+        -- =====================================================
+        -- BRAIN/NEUROLOGICAL
+        -- =====================================================
+        , CASE
+            -- GCS 3-5 or severe motor response impairment = 4
+            WHEN gcs_min <= 5 THEN 4
+            -- GCS 6-8 = 3
+            WHEN gcs_min >= 6 AND gcs_min <= 8 THEN 3
+            -- GCS 9-12 = 2
+            WHEN gcs_min >= 9 AND gcs_min <= 12 THEN 2
+            -- GCS 13-14 OR on delirium meds = 1
+            WHEN (gcs_min >= 13 AND gcs_min <= 14) OR on_delirium_med = 1 THEN 1
+            -- GCS 15 and no delirium meds = 0
+            WHEN gcs_min = 15 AND COALESCE(on_delirium_med, 0) = 0 THEN 0
+            -- Missing data = null
+            WHEN gcs_min IS NULL AND COALESCE(on_delirium_med, 0) = 0 THEN NULL
+            ELSE 0
+        END AS brain
+
+        -- =====================================================
+        -- RESPIRATORY
+        -- =====================================================
+        , CASE
+            -- 4 points: PF ≤75 with advanced support OR ECMO
+            WHEN on_ecmo = 1 THEN 4
+            WHEN pf_vent_min <= 75 AND has_advanced_support = 1 THEN 4
+            -- 3 points: PF ≤150 with advanced support
+            WHEN pf_vent_min <= 150 AND has_advanced_support = 1 THEN 3
+            -- 2 points: PF ≤225
+            WHEN pf_novent_min <= 225 THEN 2
+            WHEN pf_vent_min <= 225 THEN 2
+            -- 1 point: PF ≤300
+            WHEN pf_novent_min <= 300 THEN 1
+            WHEN pf_vent_min <= 300 THEN 1
+            -- 0 points: PF >300
+            WHEN COALESCE(pf_vent_min, pf_novent_min) IS NULL THEN NULL
+            ELSE 0
+        END AS respiratory
+
+        -- =====================================================
+        -- CARDIOVASCULAR
+        -- =====================================================
+        , CASE
+            -- 4 points: Mechanical circulatory support
+            WHEN has_mechanical_support = 1 THEN 4
+            -- Calculate combined NE+Epi dose
+            WHEN (COALESCE(rate_norepinephrine, 0) + COALESCE(rate_epinephrine, 0)) > 0.4 THEN 4
+            -- 4 points: Medium dose NE+Epi + other vasopressor
+            WHEN (COALESCE(rate_norepinephrine, 0) + COALESCE(rate_epinephrine, 0)) > 0.2
+                 AND (COALESCE(rate_norepinephrine, 0) + COALESCE(rate_epinephrine, 0)) <= 0.4
+                 AND (COALESCE(rate_dopamine, 0) > 0 OR COALESCE(rate_dobutamine, 0) > 0)
+                THEN 4
+            -- 3 points: Medium dose NE+Epi (0.2-0.4)
+            WHEN (COALESCE(rate_norepinephrine, 0) + COALESCE(rate_epinephrine, 0)) > 0.2
+                 AND (COALESCE(rate_norepinephrine, 0) + COALESCE(rate_epinephrine, 0)) <= 0.4
+                THEN 3
+            -- 3 points: Low dose NE+Epi + other vasopressor
+            WHEN (COALESCE(rate_norepinephrine, 0) + COALESCE(rate_epinephrine, 0)) > 0
+                 AND (COALESCE(rate_norepinephrine, 0) + COALESCE(rate_epinephrine, 0)) <= 0.2
+                 AND (COALESCE(rate_dopamine, 0) > 0 OR COALESCE(rate_dobutamine, 0) > 0)
+                THEN 3
+            -- 2 points: Low dose NE+Epi OR any other vasopressor
+            WHEN (COALESCE(rate_norepinephrine, 0) + COALESCE(rate_epinephrine, 0)) > 0
+                 AND (COALESCE(rate_norepinephrine, 0) + COALESCE(rate_epinephrine, 0)) <= 0.2
+                THEN 2
+            -- 2 points: Any other vasopressor (dopamine or dobutamine)
+            WHEN COALESCE(rate_dopamine, 0) > 0 OR COALESCE(rate_dobutamine, 0) > 0 THEN 2
+            -- 1 point: MAP <70 without vasopressors
+            WHEN mbp_min < 70 THEN 1
+            -- 0 points: MAP ≥70 without vasopressors
+            WHEN COALESCE(mbp_min, rate_norepinephrine, rate_epinephrine,
+                          rate_dopamine, rate_dobutamine) IS NULL THEN NULL
+            ELSE 0
+        END AS cardiovascular
+
+        -- =====================================================
+        -- LIVER
+        -- =====================================================
+        , CASE
+            -- SOFA-2: Changed thresholds to ≤ instead of <
+            WHEN bilirubin_max > 12.0 THEN 4
+            WHEN bilirubin_max > 6.0 AND bilirubin_max <= 12.0 THEN 3
+            WHEN bilirubin_max > 3.0 AND bilirubin_max <= 6.0 THEN 2
+            WHEN bilirubin_max > 1.2 AND bilirubin_max <= 3.0 THEN 1
+            WHEN bilirubin_max IS NULL THEN NULL
+            ELSE 0
+        END AS liver
+
+        -- =====================================================
+        -- KIDNEY
+        -- =====================================================
+        , CASE
+            -- 4 points: On RRT
+            WHEN on_rrt = 1 THEN 4
+            -- 4 points: Meets RRT criteria (Cr >1.2 AND (K ≥6.0 OR metabolic acidosis))
+            WHEN creatinine_max > 1.2
+                 AND (potassium_max >= 6.0
+                      OR (ph_min <= 7.2 AND bicarbonate_min <= 12))
+                THEN 4
+            -- 3 points: Cr >3.5 OR severe oliguria/anuria
+            WHEN creatinine_max > 3.5 THEN 3
+            WHEN uo_ml_kg_h_24hr < 0.3 THEN 3  -- Approximation for <0.3 ml/kg/h for ≥24h
+            -- 2 points: Cr ≤3.5 but >2.0 OR moderate oliguria
+            WHEN creatinine_max > 2.0 AND creatinine_max <= 3.5 THEN 2
+            WHEN uo_ml_kg_h_24hr >= 0.3 AND uo_ml_kg_h_24hr < 0.5 THEN 2  -- Approximation
+            -- 1 point: Cr ≤2.0 but >1.2 OR mild oliguria
+            WHEN creatinine_max > 1.2 AND creatinine_max <= 2.0 THEN 1
+            -- 0 points: Cr ≤1.2 and adequate UO
+            WHEN COALESCE(creatinine_max, uo_ml_kg_h_24hr) IS NULL THEN NULL
+            ELSE 0
+        END AS kidney
+
+        -- =====================================================
+        -- HEMOSTASIS (COAGULATION)
+        -- =====================================================
+        , CASE
+            -- SOFA-2: New thresholds
+            WHEN platelet_min <= 50 THEN 4
+            WHEN platelet_min <= 80 THEN 3
+            WHEN platelet_min <= 100 THEN 2
+            WHEN platelet_min <= 150 THEN 1
+            WHEN platelet_min IS NULL THEN NULL
+            ELSE 0
+        END AS hemostasis
+
+    FROM scorecomp
+)
+
+-- =================================================================
+-- FINAL SCORE WITH 24-HOUR ROLLING WINDOW
+-- =================================================================
+, score_final AS (
+    SELECT s.*
+        -- Take max over last 24 hours for each component
+        , COALESCE(MAX(brain) OVER w, 0) AS brain_24hours
+        , COALESCE(MAX(respiratory) OVER w, 0) AS respiratory_24hours
+        , COALESCE(MAX(cardiovascular) OVER w, 0) AS cardiovascular_24hours
+        , COALESCE(MAX(liver) OVER w, 0) AS liver_24hours
+        , COALESCE(MAX(kidney) OVER w, 0) AS kidney_24hours
+        , COALESCE(MAX(hemostasis) OVER w, 0) AS hemostasis_24hours
+
+        -- Total SOFA-2 score
+        , COALESCE(MAX(brain) OVER w, 0)
+        + COALESCE(MAX(respiratory) OVER w, 0)
+        + COALESCE(MAX(cardiovascular) OVER w, 0)
+        + COALESCE(MAX(liver) OVER w, 0)
+        + COALESCE(MAX(kidney) OVER w, 0)
+        + COALESCE(MAX(hemostasis) OVER w, 0)
+        AS sofa2_24hours
+    FROM scorecalc s
+    WINDOW w AS (
+        PARTITION BY stay_id
+        ORDER BY hr
+        ROWS BETWEEN 23 PRECEDING AND 0 FOLLOWING
+    )
+)
+
+SELECT * FROM score_final
+WHERE hr >= 0;
