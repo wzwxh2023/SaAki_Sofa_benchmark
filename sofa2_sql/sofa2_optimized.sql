@@ -166,28 +166,23 @@ WITH co AS (
       AND ce.valuenum BETWEEN 21 AND 100  -- FiO2百分比范围
 ),
 
--- 步骤3: 预计算所有SF比值 (SpO2:FiO2)
+-- 步骤3: 预计算所有SF比值 (SpO2:FiO2) - 简化版本
 , sf_ratios_all AS (
     SELECT
         spo2.stay_id,
         spo2.charttime,
         (spo2.spo2_value / (fio2.fio2_value / 100.0)) AS oxygen_ratio,  -- 关键修复：百分比转小数
-        adv.advanced_support AS has_advanced_support
+        -- 简化的呼吸支持检测：直接JOIN ventilation表
+        CASE WHEN vd.stay_id IS NOT NULL THEN 1 ELSE 0 END AS has_advanced_support
     FROM spo2_raw spo2
     INNER JOIN fio2_raw fio2
         ON spo2.stay_id = fio2.stay_id
-        AND spo2.charttime >= fio2.charttime
-        AND spo2.charttime < fio2.charttime + INTERVAL '1 hour'
-    LEFT JOIN LATERAL (
-        SELECT
-            CASE WHEN EXISTS(
-                SELECT 1 FROM mimiciv_derived.ventilation vd
-                WHERE vd.stay_id = spo2.stay_id
-                  AND vd.starttime < spo2.charttime + INTERVAL '1 hour'
-                  AND COALESCE(vd.endtime, spo2.charttime + INTERVAL '1 hour') > spo2.charttime
-                  AND vd.ventilation_status IN ('InvasiveVent', 'NonInvasiveVent', 'HFNC')
-            ) THEN 1 ELSE 0 END AS advanced_support
-    ) adv ON TRUE
+        AND fio2.charttime BETWEEN spo2.charttime - INTERVAL '1 hour' AND spo2.charttime  -- 统一向前看1小时
+    -- 直接LEFT JOIN ventilation表，简化复杂的LATERAL JOIN
+    LEFT JOIN mimiciv_derived.ventilation vd
+        ON spo2.stay_id = vd.stay_id
+        AND spo2.charttime BETWEEN vd.starttime AND vd.endtime  -- 标准的时间点-区间匹配
+        AND vd.ventilation_status IN ('InvasiveVent', 'NonInvasiveVent', 'HFNC')
     WHERE spo2.spo2_value IS NOT NULL
       AND fio2.fio2_value IS NOT NULL
 ),
