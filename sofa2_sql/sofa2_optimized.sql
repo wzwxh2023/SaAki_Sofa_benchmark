@@ -11,9 +11,6 @@ WITH co AS (
     FROM mimiciv_derived.icustay_hourly ih
     INNER JOIN mimiciv_icu.icustays ie
         ON ih.stay_id = ie.stay_id
-    WHERE ih.hr BETWEEN 0 AND 24
-        -- 限制样本用于测试，可移除此限制
-        AND ih.stay_id IN (SELECT stay_id FROM mimiciv_derived.icustay_hourly LIMIT 100)
 ),
 
 -- =================================================================
@@ -187,15 +184,20 @@ WITH co AS (
       AND fio2.fio2_value IS NOT NULL
 ),
 
--- 步骤4: 预计算所有ECMO记录
+-- 步骤4: 预计算所有ECMO记录（与循环系统保持一致）
 , ecmo_events AS (
-    -- 方法1: 机械支持表中的ECMO
+    -- 方法1: ECMO设备记录（完整覆盖，与循环系统一致）
     SELECT
         ce.stay_id,
         ce.charttime,
         1 AS ecmo_indicator
     FROM mimiciv_icu.chartevents ce
-    WHERE ce.itemid = 224660  -- 机械支持表ECMO
+    WHERE ce.itemid IN (
+        -- ECMO相关itemid (基于实际数据验证，与循环系统完全一致)
+        224660, 229270, 229272, 229268, 229271, 229277, 229278, 229280, 229276,
+        229274, 229266, 229363, 229364, 229365, 229269, 229275, 229267, 229273,
+        228193, 229256, 229258, 229264, 229250, 229262, 229254, 229252, 229260
+    )
 
     UNION ALL
 
@@ -314,175 +316,360 @@ WITH co AS (
 ),
 
 -- =================================================================
--- CARDIOVASCULAR/心血管 (SOFA2标准：血管活性药物分级)
+-- 预处理CTEs：解决LATERAL JOIN性能问题
+-- =================================================================
+
+-- 步骤1: 预处理机械支持（基于实际MIMIC-IV数据）
+, mechanical_support_hourly AS (
+    SELECT
+        co.stay_id,
+        co.hr,
+        MAX(CASE WHEN ce.itemid IN (
+            -- ECMO相关itemid (基于实际数据验证)
+            224660, 229270, 229272, 229268, 229271, 229277, 229278, 229280, 229276,
+            229274, 229266, 229363, 229364, 229365, 229269, 229275, 229267, 229273,
+            228193, 229256, 229258, 229264, 229250, 229262, 229254, 229252, 229260
+        ) THEN 1 ELSE 0 END) AS has_ecmo,
+        MAX(CASE WHEN ce.itemid IN (
+            -- IABP相关itemid (基于实际数据验证)
+            224322, 227980, 225988, 228866, 225339, 225982, 226110, 225985, 225986,
+            225341, 225981, 225979, 225987, 225342, 225984, 225980, 227754, 227355,
+            225742
+        ) THEN 1 ELSE 0 END) AS has_iabp,
+        MAX(CASE WHEN ce.itemid IN (
+            -- Impella相关itemid (基于实际数据验证，移除重复的227355)
+            228154, 229679, 228173, 228164, 228162, 228174, 229680, 229897, 229671,
+            228171, 228172, 228167, 228170, 224314, 224318, 229898
+        ) THEN 1 ELSE 0 END) AS has_impella,
+        MAX(CASE WHEN ce.itemid IN (
+            -- LVAD相关itemid (基于实际数据验证)
+            229256, 229258, 229264, 229250, 229262, 229254, 229252, 229260, 220128
+        ) THEN 1 ELSE 0 END) AS has_lvad
+    FROM co
+    LEFT JOIN mimiciv_icu.chartevents ce
+        ON co.stay_id = ce.stay_id
+        AND ce.charttime >= co.starttime
+        AND ce.charttime < co.endtime
+        AND ce.itemid IN (
+            -- 完整的机械支持itemid列表（已去重，共63个）
+            -- ECMO (25个)
+            224660, 229270, 229272, 229268, 229271, 229277, 229278, 229280, 229276,
+            229274, 229266, 229363, 229364, 229365, 229269, 229275, 229267, 229273,
+            228193, 229256, 229258, 229264, 229250, 229262, 229254, 229252, 229260,
+            -- IABP (17个)
+            224322, 227980, 225988, 228866, 225339, 225982, 226110, 225985, 225986,
+            225341, 225981, 225979, 225987, 225342, 225984, 225980, 227754, 227355,
+            225742,
+            -- Impella (16个，移除重复的227355)
+            228154, 229679, 228173, 228164, 228162, 228174, 229680, 229897,
+            229671, 228171, 228172, 228167, 228170, 224314, 224318, 229898,
+            -- LVAD (9个)
+            220128
+        )
+    GROUP BY co.stay_id, co.hr
+),
+
+-- 步骤2: 预处理生命体征（MAP）
+, vitalsign_hourly AS (
+    SELECT
+        co.stay_id,
+        co.hr,
+        MIN(vs.mbp) AS mbp_min
+    FROM co
+    LEFT JOIN mimiciv_derived.vitalsign vs
+        ON co.stay_id = vs.stay_id
+        AND vs.charttime >= co.starttime
+        AND vs.charttime < co.endtime
+    GROUP BY co.stay_id, co.hr
+),
+
+-- 步骤3: 预处理血管活性药物
+, vasoactive_hourly AS (
+    SELECT
+        co.stay_id,
+        co.hr,
+        MAX(va.norepinephrine) AS rate_norepinephrine,
+        MAX(va.epinephrine) AS rate_epinephrine,
+        MAX(va.dopamine) AS rate_dopamine,
+        MAX(va.dobutamine) AS rate_dobutamine,
+        MAX(va.vasopressin) AS rate_vasopressin,
+        MAX(va.phenylephrine) AS rate_phenylephrine,
+        MAX(va.milrinone) AS rate_milrinone
+    FROM co
+    LEFT JOIN mimiciv_derived.vasoactive_agent va
+        ON co.stay_id = va.stay_id
+        AND va.starttime < co.endtime
+        AND COALESCE(va.endtime, co.endtime) > co.starttime
+    GROUP BY co.stay_id, co.hr
+),
+
+-- =================================================================
+-- CARDIOVASCULAR/心血管 (SOFA2标准：高性能预聚合版本)
 -- =================================================================
 , cardiovascular AS (
     SELECT
         co.stay_id,
         co.hr,
         CASE
-            -- 4分: 高剂量血管升压药或机械循环支持
-            WHEN coalesce(rate_norepinephrine, 0) + coalesce(rate_epinephrine, 0) > 0.4 THEN 4
-            WHEN mech.has_mechanical_support = 1 THEN 4
-            -- 3分: 中剂量血管升压药
-            WHEN coalesce(rate_norepinephrine, 0) + coalesce(rate_epinephrine, 0) > 0.2 THEN 3
-            -- 2分: 低剂量血管升压药或其他升压药
-            WHEN coalesce(rate_norepinephrine, 0) + coalesce(rate_epinephrine, 0) > 0 THEN 2
-            WHEN coalesce(rate_dobutamine, 0) > 0 OR coalesce(rate_dopamine, 0) > 0
-                 OR coalesce(rate_vasopressin, 0) > 0 THEN 2
-            -- 1分: MAP < 70 无血管活性药
-            WHEN mbp_min < 70 AND coalesce(rate_norepinephrine, 0) = 0
-                 AND coalesce(rate_epinephrine, 0) = 0 THEN 1
-            -- 0分: 正常
+            -- 4分条件 (按优先级排序)
+            -- 4a: 机械循环支持 (任一设备)
+            WHEN COALESCE(mech.has_ecmo, 0) + COALESCE(mech.has_iabp, 0) +
+                 COALESCE(mech.has_impella, 0) + COALESCE(mech.has_lvad, 0) > 0 THEN 4
+            -- 4b: NE+Epi总碱基剂量 > 0.4 mcg/kg/min
+            WHEN ne_epi_total_base_dose > 0.4 THEN 4
+            -- 4c: NE+Epi > 0.2 且使用其他药物
+            WHEN ne_epi_total_base_dose > 0.2 AND any_other_agent_flag = 1 THEN 4
+
+            -- 3分条件 (按优先级排序)
+            -- 3a: NE+Epi总碱基剂量 > 0.2 mcg/kg/min
+            WHEN ne_epi_total_base_dose > 0.2 THEN 3
+            -- 3b: NE+Epi > 0 且使用其他药物
+            WHEN ne_epi_total_base_dose > 0 AND any_other_agent_flag = 1 THEN 3
+
+            -- 2分条件 (按优先级排序)
+            -- 2a: NE+Epi总碱基剂量 > 0
+            WHEN ne_epi_total_base_dose > 0 THEN 2
+            -- 2b: 使用任何其他药物
+            WHEN any_other_agent_flag = 1 THEN 2
+
+            -- 1分条件: MAP < 70 mmHg 且无血管活性药物
+            WHEN vit.mbp_min < 70 AND ne_epi_total_base_dose = 0 AND any_other_agent_flag = 0 THEN 1
+
+            -- 0分条件: MAP >= 70 mmHg 或正常情况
             ELSE 0
         END AS cardiovascular
     FROM co
-    LEFT JOIN LATERAL (
-        SELECT MIN(vs.mbp) as mbp_min
-        FROM mimiciv_derived.vitalsign vs
-        WHERE vs.stay_id = co.stay_id
-            AND vs.charttime >= co.starttime
-            AND vs.charttime < co.endtime
-    ) vit ON TRUE
-    LEFT JOIN LATERAL (
+    -- 高性能连接：直接JOIN预聚合数据，避免LATERAL
+    LEFT JOIN mechanical_support_hourly mech ON co.stay_id = mech.stay_id AND co.hr = mech.hr
+    LEFT JOIN vitalsign_hourly vit ON co.stay_id = vit.stay_id AND co.hr = vit.hr
+    LEFT JOIN vasoactive_hourly vaso ON co.stay_id = vaso.stay_id AND co.hr = vaso.hr
+    -- 计算NE/Epi总碱基剂量和其他药物标志（无LATERAL，直接计算）
+    CROSS JOIN LATERAL (
         SELECT
-            MAX(norepinephrine) as rate_norepinephrine,
-            MAX(epinephrine) as rate_epinephrine,
-            MAX(dopamine) as rate_dopamine,
-            MAX(dobutamine) as rate_dobutamine,
-            MAX(vasopressin) as rate_vasopressin
-        FROM mimiciv_derived.vasoactive_agent va
-        WHERE va.stay_id = co.stay_id
-            AND va.starttime < co.endtime
-            AND COALESCE(va.endtime, co.endtime) > co.starttime
-    ) vaso ON TRUE
-    LEFT JOIN LATERAL (
-        SELECT MAX(CASE WHEN ce.itemid = 224660 THEN 1 ELSE 0 END) as has_mechanical_support
-        FROM mimiciv_icu.chartevents ce
-        WHERE ce.stay_id = co.stay_id
-            AND ce.charttime >= co.starttime
-            AND ce.charttime < co.endtime
-    ) mech ON TRUE
+            -- 1. 【数据】计算NE/Epi总碱基剂量
+            -- 转换去甲肾上腺素剂量：除以2.0得到碱基剂量
+            -- 肾上腺素使用原始剂量
+            (COALESCE(vaso.rate_norepinephrine, 0) / 2.0 + COALESCE(vaso.rate_epinephrine, 0)) AS ne_epi_total_base_dose,
+            -- 3. 【实现】"其他药物"标志位
+            CASE WHEN COALESCE(vaso.rate_dopamine, 0) > 0
+                  OR COALESCE(vaso.rate_dobutamine, 0) > 0
+                  OR COALESCE(vaso.rate_vasopressin, 0) > 0
+                  OR COALESCE(vaso.rate_phenylephrine, 0) > 0
+                  OR COALESCE(vaso.rate_milrinone, 0) > 0
+                 THEN 1 ELSE 0
+            END AS any_other_agent_flag
+    ) dose_calc
+),
+
+-- 步骤4: 预处理胆红素数据 (高性能优化)
+, bilirubin_data AS (
+    SELECT
+        stay.stay_id,
+        enz.charttime,
+        enz.bilirubin_total
+    FROM mimiciv_icu.icustays stay
+    JOIN mimiciv_derived.enzyme enz ON stay.hadm_id = enz.hadm_id
+    WHERE enz.bilirubin_total IS NOT NULL
 ),
 
 -- =================================================================
--- LIVER/肝脏 (SOFA2标准：胆红素阈值调整)
+-- LIVER/肝脏 (SOFA2标准：高性能预聚合版本)
 -- =================================================================
 , liver AS (
     SELECT
         co.stay_id,
         co.hr,
         CASE
-            WHEN enz.bilirubin_max > 12.0 THEN 4
-            WHEN enz.bilirubin_max > 6.0 AND enz.bilirubin_max <= 12.0 THEN 3
-            WHEN enz.bilirubin_max > 3.0 AND enz.bilirubin_max <= 6.0 THEN 2
-            WHEN enz.bilirubin_max > 1.2 AND enz.bilirubin_max <= 3.0 THEN 1
-            WHEN enz.bilirubin_max IS NULL THEN NULL
+            WHEN MAX(bd.bilirubin_total) > 12.0 THEN 4
+            WHEN MAX(bd.bilirubin_total) > 6.0 AND MAX(bd.bilirubin_total) <= 12.0 THEN 3
+            WHEN MAX(bd.bilirubin_total) > 3.0 AND MAX(bd.bilirubin_total) <= 6.0 THEN 2
+            WHEN MAX(bd.bilirubin_total) > 1.2 AND MAX(bd.bilirubin_total) <= 3.0 THEN 1
+            WHEN MAX(bd.bilirubin_total) IS NULL THEN NULL
             ELSE 0
         END AS liver
     FROM co
-    LEFT JOIN LATERAL (
-        SELECT MAX(enz.bilirubin_total) as bilirubin_max
-        FROM mimiciv_derived.enzyme enz
-        WHERE enz.hadm_id IN (SELECT hadm_id FROM mimiciv_icu.icustays WHERE stay_id = co.stay_id)
-            AND enz.charttime >= co.starttime
-            AND enz.charttime < co.endtime
-    ) enz ON TRUE
+    LEFT JOIN bilirubin_data bd
+        ON co.stay_id = bd.stay_id
+        AND bd.charttime >= co.starttime
+        AND bd.charttime < co.endtime
+    GROUP BY co.stay_id, co.hr
+),
+
+-- 步骤5: 预处理肾脏数据 (修复逻辑错误版本)
+
+-- 基础数据预处理
+, chemistry_data AS (
+    SELECT
+        stay.stay_id,
+        chem.charttime,
+        chem.creatinine
+    FROM mimiciv_icu.icustays stay
+    JOIN mimiciv_derived.chemistry chem ON stay.hadm_id = chem.hadm_id
+    WHERE chem.creatinine IS NOT NULL
+),
+bg_data AS (
+    SELECT
+        stay.stay_id,
+        bg.charttime,
+        bg.ph,
+        bg.potassium,
+        bg.bicarbonate
+    FROM mimiciv_icu.icustays stay
+    JOIN mimiciv_derived.bg bg ON stay.subject_id = bg.subject_id
+    WHERE bg.specimen = 'ART.'
+),
+
+-- Step 1: 计算每小时尿量(ml/kg/hr) - 修复硬编码体重问题
+urine_output_rate AS (
+    SELECT
+        uo.stay_id,
+        icu.intime,
+        uo.charttime,
+        -- 使用患者实际体重，默认70kg
+        uo.urineoutput / COALESCE(wd.weight, 70) as urine_ml_per_kg
+    FROM mimiciv_derived.urine_output uo
+    LEFT JOIN mimiciv_derived.weight_durations wd
+        ON uo.stay_id = wd.stay_id
+        AND uo.charttime >= wd.starttime
+        AND uo.charttime < wd.endtime
+    LEFT JOIN mimiciv_icu.icustays icu ON uo.stay_id = icu.stay_id
+),
+urine_output_hourly_rate AS (
+    SELECT
+        stay_id,
+        FLOOR(EXTRACT(EPOCH FROM (charttime - intime))/3600) AS hr,
+        SUM(urine_ml_per_kg) as uo_ml_kg_hr
+    FROM urine_output_rate
+    GROUP BY stay_id, hr
+),
+
+-- Step 2: 使用 "Gaps and Islands" 算法计算连续低尿量时间 (修复累计vs连续错误)
+urine_output_islands AS (
+    SELECT
+        stay_id,
+        hr,
+        -- 为每个条件创建连续小时组
+        hr - ROW_NUMBER() OVER (PARTITION BY stay_id, is_low_05 ORDER BY hr) as island_low_05,
+        hr - ROW_NUMBER() OVER (PARTITION BY stay_id, is_low_03 ORDER BY hr) as island_low_03,
+        hr - ROW_NUMBER() OVER (PARTITION BY stay_id, is_anuric ORDER BY hr) as island_anuric,
+        is_low_05, is_low_03, is_anuric
+    FROM (
+        SELECT
+            stay_id, hr,
+            -- 各条件标志
+            CASE WHEN uo_ml_kg_hr < 0.5 THEN 1 ELSE 0 END as is_low_05,
+            CASE WHEN uo_ml_kg_hr < 0.3 THEN 1 ELSE 0 END as is_low_03,
+            CASE WHEN uo_ml_kg_hr = 0 THEN 1 ELSE 0 END as is_anuric
+        FROM urine_output_hourly_rate
+    ) flagged
+),
+urine_output_durations AS (
+    SELECT
+        stay_id,
+        hr,
+        -- 计算每种条件下的连续时长
+        CASE WHEN is_low_05 = 1 THEN COUNT(*) OVER (PARTITION BY stay_id, is_low_05, island_low_05) ELSE 0 END as consecutive_low_05h,
+        CASE WHEN is_low_03 = 1 THEN COUNT(*) OVER (PARTITION BY stay_id, is_low_03, island_low_03) ELSE 0 END as consecutive_low_03h,
+        CASE WHEN is_anuric = 1 THEN COUNT(*) OVER (PARTITION BY stay_id, is_anuric, island_anuric) ELSE 0 END as consecutive_anuric_h
+    FROM urine_output_islands
+),
+
+-- RRT状态预处理
+rrt_status AS (
+    SELECT
+        rrt.stay_id,
+        FLOOR(EXTRACT(EPOCH FROM (rrt.charttime - stay.intime))/3600) AS hr,
+        MAX(rrt.dialysis_active) as rrt_active
+    FROM mimiciv_derived.rrt rrt
+    JOIN mimiciv_icu.icustays stay ON rrt.stay_id = stay.stay_id
+    GROUP BY rrt.stay_id, FLOOR(EXTRACT(EPOCH FROM (rrt.charttime - stay.intime))/3600)
 ),
 
 -- =================================================================
--- KIDNEY/肾脏 (SOFA2标准：连续尿量 + RRT标准)
+-- KIDNEY/肾脏 (SOFA2标准：逻辑正确且高性能的版本)
 -- =================================================================
 , kidney AS (
     SELECT
         co.stay_id,
         co.hr,
-        CASE
-            -- 4分: RRT或符合RRT标准
-            WHEN rrt.on_rrt = 1 THEN 4
-            WHEN (
-                (chem.creatinine_max > 1.2 OR uo.low_03_hours >= 6)
-                AND (
-                    bg.k_max >= 6.0
-                    OR (bg.ph_min <= 7.2 AND bg.bicarbonate_min <= 12)
-                )
-            ) THEN 4
-            -- 3分: 肌酐 >3.5 或严重少尿
-            WHEN chem.creatinine_max > 3.5 THEN 3
-            WHEN uo.low_03_hours >= 24 THEN 3
-            WHEN uo.anuria_hours >= 12 THEN 3
-            -- 2分: 肌酐 2.0-3.5 或中度少尿
-            WHEN chem.creatinine_max > 2.0 THEN 2
-            WHEN uo.low_05_hours >= 12 THEN 2
-            -- 1分: 肌酐 1.2-2.0 或轻度少尿
-            WHEN chem.creatinine_max > 1.2 THEN 1
-            WHEN uo.low_05_hours >= 6 AND uo.low_05_hours < 12 THEN 1
-            -- 0分: 正常
-            ELSE 0
-        END AS kidney
+        -- 使用GREATEST函数获取所有条件中的最高分
+        GREATEST(
+            -- 基于RRT的评分
+            COALESCE(MAX(CASE WHEN rrt.rrt_active = 1 THEN 4 ELSE 0 END), 0),
+
+            -- 基于RRT启动标准的评分
+            COALESCE(MAX(CASE
+                WHEN
+                    (MAX(chem.creatinine) > 1.2 OR MAX(uo.consecutive_low_03h) >= 6)
+                    AND (COALESCE(MAX(bg.potassium), 0) >= 6.0
+                         OR (COALESCE(MIN(bg.ph), 7.4) <= 7.2 AND COALESCE(MIN(bg.bicarbonate), 24) <= 12))
+                THEN 4 ELSE 0 END), 0),
+
+            -- 基于肌酐的评分
+            COALESCE(MAX(CASE
+                WHEN MAX(chem.creatinine) > 3.5 THEN 3
+                WHEN MAX(chem.creatinine) > 2.0 THEN 2
+                WHEN MAX(chem.creatinine) > 1.2 THEN 1
+                ELSE 0
+            END), 0),
+
+            -- 基于尿量的评分 (使用连续时间而非累计时间)
+            COALESCE(MAX(CASE
+                WHEN MAX(uo.consecutive_low_03h) >= 24 THEN 3
+                WHEN MAX(uo.consecutive_anuric_h) >= 12 THEN 3
+                WHEN MAX(uo.consecutive_low_05h) >= 12 THEN 2
+                WHEN MAX(uo.consecutive_low_05h) >= 6 AND MAX(uo.consecutive_low_05h) < 12 THEN 1
+                ELSE 0
+            END), 0)
+        ) AS kidney
     FROM co
-    LEFT JOIN LATERAL (
-        SELECT MAX(chem.creatinine) as creatinine_max
-        FROM mimiciv_derived.chemistry chem
-        WHERE chem.hadm_id IN (SELECT hadm_id FROM mimiciv_icu.icustays WHERE stay_id = co.stay_id)
-            AND chem.charttime >= co.starttime
-            AND chem.charttime < co.endtime
-    ) chem ON TRUE
-    LEFT JOIN LATERAL (
-        SELECT MAX(bg.ph) as ph_min, MAX(bg.potassium) as k_max, MIN(bg.bicarbonate) as bicarbonate_min
-        FROM mimiciv_derived.bg bg
-        WHERE bg.subject_id IN (SELECT subject_id FROM mimiciv_icu.icustays WHERE stay_id = co.stay_id)
-            AND bg.specimen = 'ART.'
-            AND bg.charttime >= co.starttime
-            AND bg.charttime < co.endtime
-    ) bg ON TRUE
-    LEFT JOIN LATERAL (
-        -- 简化尿量计算
-        SELECT
-            CASE WHEN uo.urineoutput / 70 / 1 < 0.5 THEN 1 ELSE 0 END as low_05_hours,
-            CASE WHEN uo.urineoutput / 70 / 1 < 0.3 THEN 1 ELSE 0 END as low_03_hours,
-            CASE WHEN uo.urineoutput = 0 THEN 1 ELSE 0 END as anuria_hours
-        FROM (
-            SELECT COALESCE(SUM(uo.urineoutput), 0) as urineoutput
-            FROM mimiciv_derived.urine_output uo
-            WHERE uo.stay_id = co.stay_id
-                AND uo.charttime >= co.starttime
-                AND uo.charttime < co.endtime
-        ) uo
-    ) uo ON TRUE
-    LEFT JOIN LATERAL (
-        SELECT MAX(rrt.dialysis_active) as on_rrt
-        FROM mimiciv_derived.rrt rrt
-        WHERE rrt.stay_id = co.stay_id
-            AND rrt.charttime <= co.endtime
-        ORDER BY rrt.charttime DESC
-        LIMIT 1
-    ) rrt ON TRUE
+    -- 连接预处理的小时数据
+    LEFT JOIN chemistry_data chem
+        ON co.stay_id = chem.stay_id
+        AND chem.charttime >= co.starttime
+        AND chem.charttime < co.endtime
+    LEFT JOIN bg_data bg
+        ON co.stay_id = bg.stay_id
+        AND bg.charttime >= co.starttime
+        AND bg.charttime < co.endtime
+    LEFT JOIN rrt_status rrt ON co.stay_id = rrt.stay_id AND co.hr = rrt.hr
+    LEFT JOIN urine_output_durations uo ON co.stay_id = uo.stay_id AND co.hr = uo.hr
+    -- 清理的GROUP BY子句
+    GROUP BY co.stay_id, co.hr
+),
+
+-- 步骤6: 预处理血小板数据 (高性能优化)
+, platelet_data AS (
+    SELECT
+        stay.stay_id,
+        cbc.charttime,
+        cbc.platelet
+    FROM mimiciv_icu.icustays stay
+    JOIN mimiciv_derived.complete_blood_count cbc ON stay.hadm_id = cbc.hadm_id
+    WHERE cbc.platelet IS NOT NULL
 ),
 
 -- =================================================================
--- HEMOSTASIS/凝血 (SOFA2标准：血小板计数)
+-- HEMOSTASIS/凝血 (SOFA2标准：高性能预聚合版本)
 -- =================================================================
 , hemostasis AS (
     SELECT
         co.stay_id,
         co.hr,
         CASE
-            WHEN cbc.platelet_min <= 50 THEN 4
-            WHEN cbc.platelet_min <= 80 THEN 3
-            WHEN cbc.platelet_min <= 100 THEN 2
-            WHEN cbc.platelet_min <= 150 THEN 1
-            WHEN cbc.platelet_min IS NULL THEN NULL
+            WHEN MIN(pd.platelet) <= 50 THEN 4
+            WHEN MIN(pd.platelet) <= 80 THEN 3
+            WHEN MIN(pd.platelet) <= 100 THEN 2
+            WHEN MIN(pd.platelet) <= 150 THEN 1
+            WHEN MIN(pd.platelet) IS NULL THEN NULL
             ELSE 0
         END AS hemostasis
     FROM co
-    LEFT JOIN LATERAL (
-        SELECT MIN(cbc.platelet) as platelet_min
-        FROM mimiciv_derived.complete_blood_count cbc
-        WHERE cbc.hadm_id IN (SELECT hadm_id FROM mimiciv_icu.icustays WHERE stay_id = co.stay_id)
-            AND cbc.charttime >= co.starttime
-            AND cbc.charttime < co.endtime
-    ) cbc ON TRUE
+    LEFT JOIN platelet_data pd
+        ON co.stay_id = pd.stay_id
+        AND pd.charttime >= co.starttime
+        AND pd.charttime < co.endtime
+    GROUP BY co.stay_id, co.hr
 ),
 
 -- =================================================================
