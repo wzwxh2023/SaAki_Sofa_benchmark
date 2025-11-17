@@ -359,29 +359,16 @@ mechanical_support_hourly AS (
             228171, 228172, 228167, 228170, 224314, 224318, 229898
         ) THEN 1 ELSE 0 END) AS has_impella,
         MAX(CASE WHEN ce.itemid IN (
-            -- LVAD相关itemid (基于实际数据验证 + 新发现的LVAD变体)
-            229256, 229258, 229264, 229250, 229262, 229254, 229252, 229260, 220128,
-            220125, 229899, 229900
-        ) THEN 1 ELSE 0 END) AS has_lvad,
-        MAX(CASE WHEN ce.itemid IN (
-            -- TandemHeart设备 (新发现)
-            228223, 228226, 228219, 228225, 228222, 228224, 228203, 228227
-        ) THEN 1 ELSE 0 END) AS has_tandemheart,
-        MAX(CASE WHEN ce.itemid IN (
-            -- RVAD设备 (新发现)
-            229263, 229255, 229259, 229257, 229265, 229251, 229253, 229261
-        ) THEN 1 ELSE 0 END) AS has_rvad,
-        MAX(CASE WHEN ce.itemid IN (
-            -- 通用心脏辅助设备 (新发现)
-            229560, 229559, 228187, 228867
-        ) THEN 1 ELSE 0 END) AS has_cardiac_assist
+            -- LVAD相关itemid (基于实际数据验证)
+            229256, 229258, 229264, 229250, 229262, 229254, 229252, 229260, 220128
+        ) THEN 1 ELSE 0 END) AS has_lvad
     FROM co
     LEFT JOIN mimiciv_icu.chartevents ce
         ON co.stay_id = ce.stay_id
         AND ce.charttime >= co.starttime
         AND ce.charttime < co.endtime
         AND ce.itemid IN (
-            -- 完整的机械支持itemid列表（已去重，共88个）
+            -- 完整的机械支持itemid列表（已去重，共63个）
             -- ECMO (25个)
             224660, 229270, 229272, 229268, 229271, 229277, 229278, 229280, 229276,
             229274, 229266, 229363, 229364, 229365, 229269, 229275, 229267, 229273,
@@ -393,15 +380,8 @@ mechanical_support_hourly AS (
             -- Impella (16个，移除重复的227355)
             228154, 229679, 228173, 228164, 228162, 228174, 229680, 229897,
             229671, 228171, 228172, 228167, 228170, 224314, 224318, 229898,
-            -- LVAD (12个，包含新发现的变体)
-            220128, 220125, 229899, 229900, 229256, 229258, 229264, 229250,
-            229262, 229254, 229252, 229260,
-            -- TandemHeart (8个，新发现)
-            228223, 228226, 228219, 228225, 228222, 228224, 228203, 228227,
-            -- RVAD (8个，新发现)
-            229263, 229255, 229259, 229257, 229265, 229251, 229253, 229261,
-            -- 通用心脏辅助设备 (4个，新发现)
-            229560, 229559, 228187, 228867
+            -- LVAD (9个)
+            220128
         )
     GROUP BY co.stay_id, co.hr
 ),
@@ -441,7 +421,7 @@ vasoactive_hourly AS (
 ),
 
 -- =================================================================
--- CARDIOVASCULAR/心血管 (SOFA2标准：添加多巴胺特殊评分逻辑)
+-- CARDIOVASCULAR/心血管 (SOFA2标准：高性能预聚合版本)
 -- =================================================================
 cardiovascular AS (
     SELECT
@@ -451,53 +431,28 @@ cardiovascular AS (
             -- 4分条件 (按优先级排序)
             -- 4a: 机械循环支持 (任一设备)
             WHEN COALESCE(mech.has_ecmo, 0) + COALESCE(mech.has_iabp, 0) +
-                 COALESCE(mech.has_impella, 0) + COALESCE(mech.has_lvad, 0) +
-                 COALESCE(mech.has_tandemheart, 0) + COALESCE(mech.has_rvad, 0) +
-                 COALESCE(mech.has_cardiac_assist, 0) > 0 THEN 4
+                 COALESCE(mech.has_impella, 0) + COALESCE(mech.has_lvad, 0) > 0 THEN 4
             -- 4b: NE+Epi总碱基剂量 > 0.4 mcg/kg/min
             WHEN ne_epi_total_base_dose > 0.4 THEN 4
             -- 4c: NE+Epi > 0.2 且使用其他药物
-            WHEN ne_epi_total_base_dose > 0.2 AND other_vasopressor_flag = 1 THEN 4
-            -- 4d: 多巴胺单独使用 > 40 μg/kg/min
-            WHEN dopamine_only_score >= 4 THEN 4
+            WHEN ne_epi_total_base_dose > 0.2 AND any_other_agent_flag = 1 THEN 4
 
             -- 3分条件 (按优先级排序)
             -- 3a: NE+Epi总碱基剂量 > 0.2 mcg/kg/min
             WHEN ne_epi_total_base_dose > 0.2 THEN 3
             -- 3b: NE+Epi > 0 且使用其他药物
-            WHEN ne_epi_total_base_dose > 0 AND other_vasopressor_flag = 1 THEN 3
-            -- 3c: 多巴胺单独使用 > 20-40 μg/kg/min
-            WHEN dopamine_only_score = 3 THEN 3
+            WHEN ne_epi_total_base_dose > 0 AND any_other_agent_flag = 1 THEN 3
 
             -- 2分条件 (按优先级排序)
             -- 2a: NE+Epi总碱基剂量 > 0
             WHEN ne_epi_total_base_dose > 0 THEN 2
-            -- 2b: 使用其他血管活性药物（不包括多巴胺单独使用）
-            WHEN other_vasopressor_flag = 1 THEN 2
-            -- 2c: 多巴胺单独使用 ≤ 20 μg/kg/min
-            WHEN dopamine_only_score = 2 THEN 2
+            -- 2b: 使用任何其他药物
+            WHEN any_other_agent_flag = 1 THEN 2
 
-            -- 1分条件: 当无血管活性药物时，使用MAP分级评分（SOFA2标准保底路径）
-            -- 注释：此分支覆盖以下场景：
-            --   1. 数据缺失：vasoactive_agent表缺失或推注用药未计入持续输注
-            --   2. 舒缓医疗/Comfort Care：明确禁止使用升压药
-            --   3. 治疗上限：患者或家属决定停止积极治疗
-            --   4. 纯支持护理：仅静脉输液，无血管活性药物使用
-            --   5. 病情轻微：确实无需血管活性药物但MAP偏低
-            -- 这是SOFA2标准要求的重要保底路径，防止误判为0分
-            WHEN ne_epi_total_base_dose = 0
-                 AND other_vasopressor_flag = 0
-                 AND dopamine_only_score = 0 THEN
-                CASE
-                    WHEN vit.mbp_min < 40 THEN 4    -- MAP < 40 mmHg
-                    WHEN vit.mbp_min < 50 THEN 3    -- MAP 40-49 mmHg
-                    WHEN vit.mbp_min < 60 THEN 2    -- MAP 50-59 mmHg
-                    WHEN vit.mbp_min < 70 THEN 1    -- MAP 60-69 mmHg
-                    WHEN vit.mbp_min >= 70 THEN 0  -- MAP ≥ 70 mmHg
-                    ELSE 0  -- MAP数据缺失时默认0分
-                END
+            -- 1分条件: MAP < 70 mmHg 且无血管活性药物
+            WHEN vit.mbp_min < 70 AND ne_epi_total_base_dose = 0 AND any_other_agent_flag = 0 THEN 1
 
-            -- 0分条件: MAP >= 70 mmHg 且有血管活性药物支持（正常情况）
+            -- 0分条件: MAP >= 70 mmHg 或正常情况
             ELSE 0
         END AS cardiovascular
     FROM co
@@ -505,43 +460,21 @@ cardiovascular AS (
     LEFT JOIN mechanical_support_hourly mech ON co.stay_id = mech.stay_id AND co.hr = mech.hr
     LEFT JOIN vitalsign_hourly vit ON co.stay_id = vit.stay_id AND co.hr = vit.hr
     LEFT JOIN vasoactive_hourly vaso ON co.stay_id = vaso.stay_id AND co.hr = vaso.hr
-    -- 计算所有剂量和标志位（添加多巴胺特殊逻辑）
+    -- 计算NE/Epi总碱基剂量和其他药物标志（无LATERAL，直接计算）
     CROSS JOIN LATERAL (
         SELECT
-            -- 1. NE/Epi总碱基剂量计算
+            -- 1. 【数据】计算NE/Epi总碱基剂量
+            -- 转换去甲肾上腺素剂量：除以2.0得到碱基剂量
+            -- 肾上腺素使用原始剂量
             (COALESCE(vaso.rate_norepinephrine, 0) / 2.0 + COALESCE(vaso.rate_epinephrine, 0)) AS ne_epi_total_base_dose,
-            -- 2. 多巴胺特殊评分（SOFA2标准：仅当单独使用时）
-            CASE
-                WHEN COALESCE(vaso.rate_dopamine, 0) > 0
-                     AND COALESCE(vaso.rate_epinephrine, 0) = 0
-                     AND COALESCE(vaso.rate_norepinephrine, 0) = 0
-                     AND COALESCE(vaso.rate_dobutamine, 0) = 0
-                     AND COALESCE(vaso.rate_vasopressin, 0) = 0
-                     AND COALESCE(vaso.rate_phenylephrine, 0) = 0
-                     AND COALESCE(vaso.rate_milrinone, 0) = 0
-                THEN
-                    CASE
-                        WHEN COALESCE(vaso.rate_dopamine, 0) > 40 THEN 4
-                        WHEN COALESCE(vaso.rate_dopamine, 0) > 20 THEN 3
-                        WHEN COALESCE(vaso.rate_dopamine, 0) > 0 THEN 2
-                        ELSE 0
-                    END
-                ELSE 0
-            END AS dopamine_only_score,
-            -- 3. 其他血管活性药物标志位（不包括多巴胺单独使用）
-            CASE WHEN (COALESCE(vaso.rate_dobutamine, 0) > 0
-                      OR COALESCE(vaso.rate_vasopressin, 0) > 0
-                      OR COALESCE(vaso.rate_phenylephrine, 0) > 0
-                      OR COALESCE(vaso.rate_milrinone, 0) > 0)
-                     OR (COALESCE(vaso.rate_dopamine, 0) > 0 AND (
-                         COALESCE(vaso.rate_epinephrine, 0) > 0
-                         OR COALESCE(vaso.rate_norepinephrine, 0) > 0
-                         OR COALESCE(vaso.rate_dobutamine, 0) > 0
-                         OR COALESCE(vaso.rate_vasopressin, 0) > 0
-                         OR COALESCE(vaso.rate_phenylephrine, 0) > 0
-                         OR COALESCE(vaso.rate_milrinone, 0) > 0))
+            -- 3. 【实现】"其他药物"标志位
+            CASE WHEN COALESCE(vaso.rate_dopamine, 0) > 0
+                  OR COALESCE(vaso.rate_dobutamine, 0) > 0
+                  OR COALESCE(vaso.rate_vasopressin, 0) > 0
+                  OR COALESCE(vaso.rate_phenylephrine, 0) > 0
+                  OR COALESCE(vaso.rate_milrinone, 0) > 0
                  THEN 1 ELSE 0
-            END AS other_vasopressor_flag
+            END AS any_other_agent_flag
     ) dose_calc
 ),
 
@@ -603,136 +536,36 @@ bg_data AS (
     WHERE bg.specimen = 'ART.'
 ),
 
--- Step 1: 为每个stay_id查找最佳体重（多层次查找策略）
-patient_weights AS (
-    SELECT
-        icu.stay_id,
-        -- 优先级1：使用ICU期间记录的体重（最准确）
-        COALESCE(
-            -- 查找该ICU住院期间的任意体重记录
-            (SELECT wd.weight
-             FROM mimiciv_derived.weight_durations wd
-             WHERE wd.stay_id = icu.stay_id
-             AND wd.weight IS NOT NULL
-             AND wd.weight > 0
-             ORDER BY wd.starttime
-             LIMIT 1),
-            -- 优先级2：如果没有ICU体重，使用该患者历史体重的中位数
-            (SELECT AVG(wd.weight)
-             FROM mimiciv_derived.weight_durations wd
-             WHERE wd.stay_id IN (
-                 SELECT icu2.stay_id
-                 FROM mimiciv_icu.icustays icu2
-                 WHERE icu2.subject_id = icu.subject_id
-             )
-             AND wd.weight IS NOT NULL
-             AND wd.weight > 0),
-            -- 优先级3：基于性别和年龄的估算体重（临床常用公式）
-            CASE
-                WHEN p.gender = 'M' THEN  -- 男性
-                    CASE
-                        WHEN p.anchor_age < 20 THEN 65.0
-                        WHEN p.anchor_age < 40 THEN 70.0
-                        WHEN p.anchor_age < 60 THEN 75.0
-                        WHEN p.anchor_age < 80 THEN 70.0
-                        ELSE 65.0
-                    END
-                WHEN p.gender = 'F' THEN  -- 女性
-                    CASE
-                        WHEN p.anchor_age < 20 THEN 55.0
-                        WHEN p.anchor_age < 40 THEN 60.0
-                        WHEN p.anchor_age < 60 THEN 65.0
-                        WHEN p.anchor_age < 80 THEN 60.0
-                        ELSE 55.0
-                    END
-                ELSE 70.0  -- 性别未知时的默认值
-            END,
-            -- 优先级4：最终默认值（临床标准默认体重）
-            70.0
-        ) AS patient_weight
-    FROM mimiciv_icu.icustays icu
-    LEFT JOIN mimiciv_hosp.patients p ON icu.subject_id = p.subject_id
-),
-
--- Step 2: 计算真实每小时尿量(ml/kg/hr) - 使用最佳体重数据
-urine_output_raw AS (
+-- Step 1: 计算每小时尿量(ml/kg/hr) - 修复硬编码体重问题
+urine_output_rate AS (
     SELECT
         uo.stay_id,
-        uo.charttime,
-        -- 使用多层次查找的最佳体重
-        uo.urineoutput / pw.patient_weight as urine_ml_per_kg,
         icu.intime,
-        pw.patient_weight  -- 保留体重信息用于验证
+        uo.charttime,
+        -- 使用患者实际体重，默认70kg
+        uo.urineoutput / COALESCE(wd.weight, 70) as urine_ml_per_kg
     FROM mimiciv_derived.urine_output uo
-    JOIN patient_weights pw ON uo.stay_id = pw.stay_id
+    LEFT JOIN mimiciv_derived.weight_durations wd
+        ON uo.stay_id = wd.stay_id
+        AND uo.charttime >= wd.starttime
+        AND uo.charttime < wd.endtime
     LEFT JOIN mimiciv_icu.icustays icu ON uo.stay_id = icu.stay_id
-    WHERE uo.urineoutput IS NOT NULL
 ),
-
--- Step 2: 创建每小时时间序列（确保所有小时都有记录）
-hourly_timeline AS (
+urine_output_hourly_rate AS (
     SELECT
         stay_id,
-        intime,
-        outtime,
-        generate_series(
-            0,
-            FLOOR(EXTRACT(EPOCH FROM (outtime - intime))/3600)::integer
-        ) AS hr
-    FROM mimiciv_icu.icustays
+        FLOOR(EXTRACT(EPOCH FROM (charttime - intime))/3600) AS hr,
+        SUM(urine_ml_per_kg) as uo_ml_kg_hr
+    FROM urine_output_rate
+    GROUP BY stay_id, hr
 ),
 
--- Step 3: 计算每个小时的尿量（聚合该小时内的所有尿量记录）
-urine_output_hourly AS (
-    SELECT
-        co.stay_id,
-        co.hr,
-        co.intime,
-        co.outtime,
-        SUM(uo.urine_ml_per_kg) as uo_ml_kg_hr
-    FROM hourly_timeline co
-    LEFT JOIN urine_output_raw uo
-        ON co.stay_id = uo.stay_id
-        AND uo.charttime >= co.intime + INTERVAL '1 hour' * co.hr
-        AND uo.charttime < co.intime + INTERVAL '1 hour' * (co.hr + 1)
-    GROUP BY co.stay_id, co.hr, co.intime, co.outtime
-),
-
--- Step 4: 使用滑动窗口计算6h、12h、24h累计尿量和平均尿量
-urine_output_sliding_windows AS (
-    SELECT
-        stay_id,
-        hr,
-        uo_ml_kg_hr,
-        -- 6小时滑动窗口：累计6小时尿量，计算平均尿量
-        SUM(uo_ml_kg_hr) OVER (
-            PARTITION BY stay_id
-            ORDER BY hr
-            ROWS BETWEEN 5 PRECEDING AND 0 FOLLOWING
-        ) / 6.0 as uo_avg_6h,
-
-        -- 12小时滑动窗口：累计12小时尿量，计算平均尿量
-        SUM(uo_ml_kg_hr) OVER (
-            PARTITION BY stay_id
-            ORDER BY hr
-            ROWS BETWEEN 11 PRECEDING AND 0 FOLLOWING
-        ) / 12.0 as uo_avg_12h,
-
-        -- 24小时滑动窗口：累计24小时尿量，计算平均尿量
-        SUM(uo_ml_kg_hr) OVER (
-            PARTITION BY stay_id
-            ORDER BY hr
-            ROWS BETWEEN 23 PRECEDING AND 0 FOLLOWING
-        ) / 24.0 as uo_avg_24h
-    FROM urine_output_hourly
-),
-
--- Step 5: 使用 "Gaps and Islands" 算法计算连续低尿量时间（基于真实滑动窗口数据）
+-- Step 2: 使用 "Gaps and Islands" 算法计算连续低尿量时间 (修复累计vs连续错误)
 urine_output_islands AS (
     SELECT
         stay_id,
         hr,
-        -- 为每个条件创建连续小时组（基于滑动窗口平均尿量）
+        -- 为每个条件创建连续小时组
         hr - ROW_NUMBER() OVER (PARTITION BY stay_id, is_low_05 ORDER BY hr) as island_low_05,
         hr - ROW_NUMBER() OVER (PARTITION BY stay_id, is_low_03 ORDER BY hr) as island_low_03,
         hr - ROW_NUMBER() OVER (PARTITION BY stay_id, is_anuric ORDER BY hr) as island_anuric,
@@ -740,23 +573,21 @@ urine_output_islands AS (
     FROM (
         SELECT
             stay_id, hr,
-            -- 各条件标志（基于6小时滑动窗口平均尿量，符合SOFA2标准）
-            CASE WHEN uo_avg_6h < 0.5 THEN 1 ELSE 0 END as is_low_05,
-            CASE WHEN uo_avg_6h < 0.3 THEN 1 ELSE 0 END as is_low_03,
+            -- 各条件标志
+            CASE WHEN uo_ml_kg_hr < 0.5 THEN 1 ELSE 0 END as is_low_05,
+            CASE WHEN uo_ml_kg_hr < 0.3 THEN 1 ELSE 0 END as is_low_03,
             CASE WHEN uo_ml_kg_hr = 0 THEN 1 ELSE 0 END as is_anuric
-        FROM urine_output_sliding_windows
+        FROM urine_output_hourly_rate
     ) flagged
 ),
 urine_output_durations AS (
     SELECT
         stay_id,
         hr,
-        -- 计算每种条件下的连续时长（真实的连续时间）
+        -- 计算每种条件下的连续时长
         CASE WHEN is_low_05 = 1 THEN COUNT(*) OVER (PARTITION BY stay_id, is_low_05, island_low_05) ELSE 0 END as consecutive_low_05h,
         CASE WHEN is_low_03 = 1 THEN COUNT(*) OVER (PARTITION BY stay_id, is_low_03, island_low_03) ELSE 0 END as consecutive_low_03h,
-        CASE WHEN is_anuric = 1 THEN COUNT(*) OVER (PARTITION BY stay_id, is_anuric, island_anuric) ELSE 0 END as consecutive_anuric_h,
-        -- 保留原始滑动窗口数据用于评分判断
-        uo_avg_6h, uo_avg_12h, uo_avg_24h
+        CASE WHEN is_anuric = 1 THEN COUNT(*) OVER (PARTITION BY stay_id, is_anuric, island_anuric) ELSE 0 END as consecutive_anuric_h
     FROM urine_output_islands
 ),
 
@@ -804,10 +635,6 @@ kidney_hourly_aggregates AS (
         MAX(uo.consecutive_low_05h) AS consecutive_low_05h_max,
         MAX(uo.consecutive_low_03h) AS consecutive_low_03h_max,
         MAX(uo.consecutive_anuric_h) AS consecutive_anuric_h_max,
-        -- 滑动窗口数据（6h、12h、24h平均尿量）
-        MAX(uo.uo_avg_6h) AS uo_avg_6h_max,
-        MAX(uo.uo_avg_12h) AS uo_avg_12h_max,
-        MAX(uo.uo_avg_24h) AS uo_avg_24h_max,
         MAX(CASE WHEN rrt.rrt_active = 1 THEN 1 ELSE 0 END) AS rrt_active_flag
     FROM co
     LEFT JOIN chemistry_data chem
@@ -838,14 +665,10 @@ kidney AS (
                 WHEN creatinine_max > 2.0 THEN 2
                 WHEN creatinine_max > 1.2 THEN 1
                 ELSE 0 END,
-            -- 尿量评分（SOFA2标准：基于滑动窗口连续时间）
             CASE
-                -- 3分：<0.3 mL/kg/h ≥24小时 或 无尿≥12小时
                 WHEN consecutive_low_03h_max >= 24 THEN 3
                 WHEN consecutive_anuric_h_max >= 12 THEN 3
-                -- 2分：<0.5 mL/kg/h ≥12小时
                 WHEN consecutive_low_05h_max >= 12 THEN 2
-                -- 1分：<0.5 mL/kg/h 持续6-12小时
                 WHEN consecutive_low_05h_max >= 6 THEN 1
                 ELSE 0 END
         ) AS kidney

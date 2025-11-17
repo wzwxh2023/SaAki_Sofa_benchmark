@@ -102,7 +102,59 @@ WITH co AS (
     WHERE gcs.gcs IS NOT NULL  -- 只要有GCS记录就保留
 )
 
--- 步骤3: 前向填补最近的GCS值
+-- 步骤2.5: 为每个GCS记录标记镇静状态（关键修复）
+, gcs_with_sedation_status AS (
+    SELECT
+        gc.stay_id,
+        gc.charttime,
+        gc.gcs_clean,
+        gc.gcs_motor_clean,
+        gc.gcs_verbal_clean,
+        gc.gcs_eyes_clean,
+        gc.is_complete,
+        -- 检测在GCS记录时间点是否使用了镇静药物
+        MAX(CASE
+            WHEN pr.starttime <= gc.charttime
+            AND COALESCE(pr.stoptime, gc.charttime) >= gc.charttime
+            AND LOWER(pr.drug) LIKE ANY(ARRAY[
+                '%propofol%', '%midazolam%', '%lorazepam%', '%diazepam%',
+                '%fentanyl%', '%remifentanil%', '%morphine%', '%hydromorphone%',
+                '%dexmedetomidine%'
+            ])
+            THEN 1 ELSE 0
+        END) AS on_sedation_meds_at_gcs,
+        -- 检测在GCS记录时间点是否使用了肌松药物
+        MAX(CASE
+            WHEN pr.starttime <= gc.charttime
+            AND COALESCE(pr.stoptime, gc.charttime) >= gc.charttime
+            AND LOWER(pr.drug) LIKE ANY(ARRAY[
+                '%cisatracurium%', '%vecuronium%', '%rocuronium%', '%atracurium%',
+                '%succinylcholine%', '%pancuronium%'
+            ])
+            THEN 1 ELSE 0
+        END) AS on_paralytics_at_gcs,
+        -- 检测在GCS记录时间点的RASS评分
+        MAX(CASE
+            WHEN ce.charttime = gc.charttime
+            AND ce.itemid IN (223900, 220739)
+            AND ce.valuenum IS NOT NULL
+            AND CAST(ce.valuenum AS NUMERIC) <= -4
+            THEN 1 ELSE 0
+        END) AS deep_sedation_at_gcs
+    FROM gcs_clean gc
+    LEFT JOIN mimiciv_icu.icustays icu
+        ON gc.stay_id = icu.stay_id
+    LEFT JOIN mimiciv_hosp.prescriptions pr
+        ON icu.hadm_id = pr.hadm_id
+    LEFT JOIN mimiciv_icu.chartevents ce
+        ON gc.stay_id = ce.stay_id
+        AND ce.charttime = gc.charttime
+        AND ce.itemid IN (223900, 220739)
+    GROUP BY gc.stay_id, gc.charttime, gc.gcs_clean, gc.gcs_motor_clean,
+             gc.gcs_verbal_clean, gc.gcs_eyes_clean, gc.is_complete
+)
+
+-- 步骤3: 智能GCS选择（镇静前回溯修复）
 , gcs_forward_fill AS (
     SELECT
         co.stay_id,
@@ -113,26 +165,71 @@ WITH co AS (
         gcs_lookup.nearest_motor,
         gcs_lookup.nearest_verbal,
         gcs_lookup.nearest_eyes,
-        CASE
-            WHEN gcs_lookup.charttime IS NOT NULL
-                 AND gcs_lookup.charttime >= co.starttime
-                 AND gcs_lookup.charttime < co.endtime
-            THEN 1 ELSE 0
-        END AS has_current_gcs
+        gcs_lookup.is_sedated_at_selected_gcs,
+        gcs_lookup.has_current_gcs,
+        gcs_lookup.selected_gcs_time
     FROM co
     LEFT JOIN LATERAL (
-        -- 取截至本小时结束前最近一次完整的GCS记录（满足镇静前回溯要求）
+        -- 智能GCS选择逻辑：如果当前镇静，回溯到最近非镇静的GCS
+        WITH current_hour_sedation AS (
+            SELECT
+                MAX(COALESCE(on_sedation_meds, 0)) as sedation_flag,
+                MAX(COALESCE(on_paralytics, 0)) as paralytics_flag,
+                MAX(COALESCE(deep_sedation, 0)) as deep_sedation_flag
+            FROM sedation_detection sd
+            WHERE sd.stay_id = co.stay_id AND sd.hr = co.hr
+        ),
+        gcs_candidates AS (
+            SELECT
+                gss.charttime,
+                gss.gcs_clean,
+                gss.gcs_motor_clean,
+                gss.gcs_verbal_clean,
+                gss.gcs_eyes_clean,
+                gss.is_complete,
+                gss.on_sedation_meds_at_gcs,
+                gss.on_paralytics_at_gcs,
+                gss.deep_sedation_at_gcs,
+                -- 标记是否镇静状态
+                CASE WHEN (gss.on_sedation_meds_at_gcs = 1
+                         OR gss.on_paralytics_at_gcs = 1
+                         OR gss.deep_sedation_at_gcs = 1)
+                     THEN 1 ELSE 0 END as is_sedated
+            FROM gcs_with_sedation_status gss
+            WHERE gss.stay_id = co.stay_id
+              AND gss.charttime <= co.endtime
+              AND gss.is_complete = 1  -- 只要完整的GCS记录
+        ),
+        final_selection AS (
+            SELECT
+                charttime,
+                gcs_clean,
+                gcs_motor_clean,
+                gcs_verbal_clean,
+                gcs_eyes_clean,
+                is_sedated,
+                -- 标记当前小时内是否有GCS
+                CASE WHEN charttime >= co.starttime AND charttime < co.endtime
+                     THEN 1 ELSE 0 END as is_current_hour
+            FROM gcs_candidates
+            ORDER BY
+                -- 优先级1: 如果当前小时有非镇静GCS，优先选择
+                CASE WHEN is_current_hour = 1 AND is_sedated = 0 THEN 0 ELSE 1 END,
+                -- 优先级2: 非镇静状态优先
+                is_sedated,
+                -- 优先级3: 时间最近优先
+                charttime DESC
+            LIMIT 1
+        )
         SELECT
-            gcs_clean.charttime,
-            gcs_clean.gcs_clean AS nearest_gcs,
-            gcs_clean.gcs_motor_clean AS nearest_motor,
-            gcs_clean.gcs_verbal_clean AS nearest_verbal,
-            gcs_clean.gcs_eyes_clean AS nearest_eyes
-        FROM gcs_clean
-        WHERE gcs_clean.stay_id = co.stay_id
-          AND gcs_clean.charttime <= co.endtime
-        ORDER BY gcs_clean.charttime DESC
-        LIMIT 1
+            gcs_clean AS nearest_gcs,
+            gcs_motor_clean AS nearest_motor,
+            gcs_verbal_clean AS nearest_verbal,
+            gcs_eyes_clean AS nearest_eyes,
+            is_sedated AS is_sedated_at_selected_gcs,
+            is_current_hour AS has_current_gcs,
+            charttime AS selected_gcs_time
+        FROM final_selection
     ) gcs_lookup ON TRUE
 )
 
@@ -146,6 +243,8 @@ WITH co AS (
         nearest_verbal AS verbal_component,
         nearest_eyes AS eyes_component,
         has_current_gcs,
+        is_sedated_at_selected_gcs,
+        selected_gcs_time,
         CASE
             -- 如果没有可用GCS数据
             WHEN nearest_gcs IS NULL THEN NULL
@@ -157,7 +256,7 @@ WITH co AS (
             ELSE NULL
         END AS effective_gcs
     FROM gcs_forward_fill
-    WHERE has_current_gcs = 1 OR nearest_gcs IS NOT NULL  -- 确保有GCS数据才保留
+    WHERE (has_current_gcs = 1 OR nearest_gcs IS NOT NULL)  -- 确保有GCS数据才保留
 )
 
 -- 步骤5: 谵妄药物检测
@@ -207,13 +306,13 @@ WITH co AS (
         CASE
             WHEN ce.itemid IN (227583, 227287) THEN 'CPAP'
             WHEN ce.itemid IN (227577, 227578, 227579, 227580, 227581, 227582, 227288) THEN 'BiPAP'
-            WHEN ce.itemid IN (226708) THEN 'HFNC'
+            -- WHEN ce.itemid IN (226708) THEN 'HFNC'  -- itemid不存在，已删除
             ELSE 'Other_High_Support'
         END AS ventilation_status,
         1 AS has_advanced_support,
         'chartevents_cpap' AS source
     FROM mimiciv_icu.chartevents ce
-    WHERE ce.itemid IN (226708, 227287, 227288, 227577, 227578, 227579, 227580, 227581, 227582, 227583)
+    WHERE ce.itemid IN (227287, 227288, 227577, 227578, 227579, 227580, 227581, 227582, 227583)
       AND ce.valuenum IS NOT NULL
       AND (ce.valuenum > 0 OR ce.value IS NOT NULL)
 )
@@ -287,31 +386,15 @@ WITH co AS (
     GROUP BY co.stay_id, co.hr, co.starttime, co.endtime
 )
 
--- 机械循环支持（供呼吸/心血管评分检测ECMO/IABP等）- 修复版本
+-- ECMO机械支持检测（基于数据库验证的有效方法）
 , mechanical_support AS (
     SELECT DISTINCT
         ce.stay_id,
         ce.charttime,
-        CASE
-            WHEN ce.itemid IN (224660) THEN 'ECMO'  -- 基于数据库验证更新
-            WHEN ce.itemid IN (224272, 224322, 225335, 225336, 225337, 225338, 225339) THEN 'IABP'
-            WHEN ce.itemid IN (224314, 224318) THEN 'Impella'  -- 基于数据库验证更新
-            ELSE 'Other_Mechanical_Support'
-        END AS device_type,
+        'ECMO' AS device_type,
         1 AS has_mechanical_support
     FROM mimiciv_icu.chartevents ce
-    WHERE ce.itemid IN (224660, 224272, 224322, 225335, 225336, 225337, 225338, 225339, 224314, 224318)
-       OR (
-            ce.itemid IN (
-                SELECT itemid
-                FROM mimiciv_icu.d_items
-                WHERE LOWER(label) LIKE '%ecmo%'
-                   OR LOWER(label) LIKE '%iabp%'
-                   OR LOWER(label) LIKE '%impella%'
-                   OR LOWER(label) LIKE '%lvad%'
-            )
-            AND ce.value IS NOT NULL
-        )
+    WHERE ce.itemid = 224660  -- 仅保留有效的ECMO检测itemid
 )
 
 -- 血气数据
@@ -451,44 +534,77 @@ WITH co AS (
     GROUP BY co.stay_id, co.hr
 )
 
--- ECMO检测（SOFA-2兼容的全面检测）
+-- ECMO检测（仅保留验证有效的方法2和4）
 , ecmo_resp AS (
     SELECT DISTINCT
         co.stay_id,
         co.hr,
         MAX(CASE
-            -- 方法1: 直接ECMO状态指示器
-            WHEN ce.charttime >= co.starttime AND ce.charttime < co.endtime
-            AND ce.itemid IN (229815, 229816) AND ce.valuenum = 1 THEN 1
-            -- 方法2: 通过机械支持表检测ECMO（使用修复后的itemid）
+            -- 方法2: 通过机械支持表检测ECMO（验证有效）
             WHEN ms.has_mechanical_support = 1 AND ms.device_type = 'ECMO'
                  AND ms.charttime >= co.starttime AND ms.charttime < co.endtime THEN 1
-            -- 方法3: 通过通气状态检测ECMO相关模式
-            WHEN v.ventilation_status ILIKE '%ECMO%'
-                 AND v.starttime < co.endtime AND COALESCE(v.endtime, co.endtime) > co.starttime THEN 1
-            -- 方法4: 通过procedureevents检测ECMO操作
+            -- 方法4: 通过procedureevents检测ECMO操作（验证有效）
             WHEN pe.starttime < co.endtime
                  AND COALESCE(pe.endtime, pe.starttime) > co.starttime
-                 AND pe.itemid IN (
-                    SELECT itemid
-                    FROM mimiciv_icu.d_items
-                    WHERE LOWER(label) LIKE ANY(ARRAY['%ecmo%', '%extracorporeal%', '%membrane%'])
-                 ) THEN 1
+                 AND pe.itemid IN (229529, 229530)  -- ECMO Inflow/Outflow Line
+            THEN 1
             ELSE 0
         END) AS on_ecmo
     FROM co
-    LEFT JOIN mimiciv_icu.chartevents ce
-        ON co.stay_id = ce.stay_id
     LEFT JOIN mechanical_support ms
         ON co.stay_id = ms.stay_id
-    LEFT JOIN mimiciv_derived.ventilation v
-        ON co.stay_id = v.stay_id
     LEFT JOIN mimiciv_icu.procedureevents pe
         ON co.stay_id = pe.stay_id
-    WHERE
-        ce.itemid IN (229815, 229816, 224660)  -- 添加修复后的ECMO itemid
-        OR ms.device_type = 'ECMO'
-        OR v.ventilation_status ILIKE '%ECMO%'
+    WHERE ms.device_type = 'ECMO'
+       OR pe.itemid IN (229529, 229530)
+    GROUP BY co.stay_id, co.hr
+)
+
+-- =================================================================
+-- SECTION 3: CARDIOVASCULAR (简化版本)
+-- =================================================================
+, vs AS (
+    SELECT DISTINCT
+        co.stay_id, co.hr
+        , MIN(vs.mbp) AS mbp_min
+    FROM co
+    LEFT JOIN mimiciv_derived.vitalsign vs
+        ON co.stay_id = vs.stay_id
+            AND vs.charttime >= co.starttime
+            AND vs.charttime < co.endtime
+    GROUP BY co.stay_id, co.hr
+)
+
+, vaso_primary AS (
+    SELECT
+        co.stay_id,
+        co.hr,
+        MAX(va.norepinephrine) AS rate_norepinephrine,
+        MAX(va.epinephrine) AS rate_epinephrine,
+        MAX(va.dopamine) AS rate_dopamine,
+        MAX(va.dobutamine) AS rate_dobutamine,
+        MAX(va.vasopressin) AS rate_vasopressin,
+        MAX(va.phenylephrine) AS rate_phenylephrine,
+        MAX(va.milrinone) AS rate_milrinone
+    FROM co
+    LEFT JOIN mimiciv_derived.vasoactive_agent va
+        ON co.stay_id = va.stay_id
+        AND va.starttime < co.endtime
+        AND COALESCE(va.endtime, co.endtime) > co.starttime
+    GROUP BY co.stay_id, co.hr
+)
+
+-- 机械循环支持按小时聚合（供心血管评分使用）
+, mech_support_hourly AS (
+    SELECT
+        co.stay_id,
+        co.hr,
+        MAX(ms.has_mechanical_support) AS has_mechanical_support
+    FROM co
+    LEFT JOIN mechanical_support ms
+        ON co.stay_id = ms.stay_id
+        AND ms.charttime >= co.starttime
+        AND ms.charttime < co.endtime
     GROUP BY co.stay_id, co.hr
 )
 
@@ -691,54 +807,6 @@ uo_max_durations AS (
 )
 
 -- =================================================================
--- SECTION 3: CARDIOVASCULAR (简化版本)
--- =================================================================
-, vs AS (
-    SELECT DISTINCT
-        co.stay_id, co.hr
-        , MIN(vs.mbp) AS mbp_min
-    FROM co
-    LEFT JOIN mimiciv_derived.vitalsign vs
-        ON co.stay_id = vs.stay_id
-            AND vs.charttime >= co.starttime
-            AND vs.charttime < co.endtime
-    GROUP BY co.stay_id, co.hr
-)
-
-, vaso_primary AS (
-    SELECT
-        co.stay_id,
-        co.hr,
-        MAX(va.norepinephrine) AS rate_norepinephrine,
-        MAX(va.epinephrine) AS rate_epinephrine,
-        MAX(va.dopamine) AS rate_dopamine,
-        MAX(va.dobutamine) AS rate_dobutamine,
-        MAX(va.vasopressin) AS rate_vasopressin,
-        MAX(va.phenylephrine) AS rate_phenylephrine,
-        MAX(va.milrinone) AS rate_milrinone
-    FROM co
-    LEFT JOIN mimiciv_derived.vasoactive_agent va
-        ON co.stay_id = va.stay_id
-        AND va.starttime < co.endtime
-        AND COALESCE(va.endtime, co.endtime) > co.starttime
-    GROUP BY co.stay_id, co.hr
-)
-
--- 机械循环支持按小时聚合（供心血管评分使用）
-, mech_support_hourly AS (
-    SELECT
-        co.stay_id,
-        co.hr,
-        MAX(ms.has_mechanical_support) AS has_mechanical_support
-    FROM co
-    LEFT JOIN mechanical_support ms
-        ON co.stay_id = ms.stay_id
-        AND ms.charttime >= co.starttime
-        AND ms.charttime < co.endtime
-    GROUP BY co.stay_id, co.hr
-)
-
--- =================================================================
 -- 综合评分计算
 -- =================================================================
 , scorecomp AS (
@@ -893,8 +961,15 @@ uo_max_durations AS (
                  OR COALESCE(rate_phenylephrine, 0) > 0
                  OR COALESCE(rate_milrinone, 0) > 0
                  OR COALESCE(rate_dopamine, 0) > 0 THEN 2
-            -- 替代评分：仅基于MAP
-            WHEN mbp_min IS NOT NULL THEN
+            -- 替代评分：仅在无血管活性药物数据时使用MAP评分
+            WHEN mbp_min IS NOT NULL
+                 AND COALESCE(rate_norepinephrine, 0) = 0
+                 AND COALESCE(rate_epinephrine, 0) = 0
+                 AND COALESCE(rate_dopamine, 0) = 0
+                 AND COALESCE(rate_dobutamine, 0) = 0
+                 AND COALESCE(rate_vasopressin, 0) = 0
+                 AND COALESCE(rate_phenylephrine, 0) = 0
+                 AND COALESCE(rate_milrinone, 0) = 0 THEN
                 CASE
                     WHEN mbp_min >= 70 THEN 0
                     WHEN mbp_min >= 60 THEN 1
@@ -989,6 +1064,62 @@ uo_max_durations AS (
 )
 
 -- =================================================================
+-- SOFA-2 最终评分（参考SOFA1的24小时窗口实现）
+-- =================================================================
+, score_final AS (
+    SELECT s.*
+        -- Combine all the scores to get SOFA-2
+        -- Impute 0 if the score is missing
+        -- the window function takes the max over the last 24 hours (参考SOFA1官方实现)
+        , COALESCE(
+            MAX(brain) OVER w
+            , 0) AS brain_24hours
+        , COALESCE(
+            MAX(respiratory) OVER w
+            , 0) AS respiratory_24hours
+        , COALESCE(
+            MAX(cardiovascular) OVER w
+            , 0) AS cardiovascular_24hours
+        , COALESCE(
+            MAX(liver) OVER w
+            , 0) AS liver_24hours
+        , COALESCE(
+            MAX(kidney) OVER w
+            , 0) AS kidney_24hours
+        , COALESCE(
+            MAX(hemostasis) OVER w
+            , 0) AS hemostasis_24hours
+
+        -- sum together data for final SOFA-2 (基于24小时窗口最大值)
+        , COALESCE(
+            MAX(brain) OVER w
+            , 0)
+        + COALESCE(
+            MAX(respiratory) OVER w
+            , 0)
+        + COALESCE(
+            MAX(cardiovascular) OVER w
+            , 0)
+        + COALESCE(
+            MAX(liver) OVER w
+            , 0)
+        + COALESCE(
+            MAX(kidney) OVER w
+            , 0)
+        + COALESCE(
+            MAX(hemostasis) OVER w
+            , 0)
+        AS sofa2_24hours
+    FROM scorecomp s
+    WINDOW w AS
+        (
+            PARTITION BY stay_id
+            ORDER BY hr
+            ROWS BETWEEN 23 PRECEDING AND 0 FOLLOWING
+        )
+)
+
+-- =================================================================
 -- 最终输出
 -- =================================================================
 SELECT
@@ -998,18 +1129,27 @@ SELECT
     hr,
     starttime,
     endtime,
-    ratio_type,
-    oxygen_ratio,
-    has_advanced_support,
-    on_ecmo,
+    -- 当前小时的组件评分（原始数据）
     brain,
     respiratory,
     cardiovascular,
     liver,
     kidney,
     hemostasis,
-    (COALESCE(brain, 0) + COALESCE(respiratory, 0) + COALESCE(cardiovascular, 0) +
-     COALESCE(liver, 0) + COALESCE(kidney, 0) + COALESCE(hemostasis, 0)) AS sofa2_total
-FROM scorecomp
+    -- SOFA-2标准：过去24小时窗口内的最差评分
+    brain_24hours,
+    respiratory_24hours,
+    cardiovascular_24hours,
+    liver_24hours,
+    kidney_24hours,
+    hemostasis_24hours,
+    -- 辅助信息
+    ratio_type,
+    oxygen_ratio,
+    has_advanced_support,
+    on_ecmo,
+    -- SOFA-2总分（基于24小时窗口）
+    sofa2_24hours
+FROM score_final
 WHERE hr >= 0
 ORDER BY stay_id, hr;
