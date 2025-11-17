@@ -24,7 +24,7 @@ WITH co AS (
     SELECT ih.stay_id, ie.hadm_id, ie.subject_id
         , hr
         -- start/endtime for this hour
-        , DATETIME_SUB(ih.endtime, INTERVAL '1' HOUR) AS starttime
+        , ih.endtime - INTERVAL '1 HOUR' AS starttime
         , ih.endtime
     FROM mimiciv_derived.icustay_hourly ih
     INNER JOIN mimiciv_icu.icustays ie
@@ -48,8 +48,8 @@ WITH co AS (
 , delirium_meds AS (
     SELECT DISTINCT
         ie.stay_id,
-        pr.startdate,
-        pr.stopdate,
+        pr.starttime::date AS startdate,
+        pr.stoptime::date AS stopdate,
         1 AS on_delirium_med
     FROM mimiciv_icu.icustays ie
     INNER JOIN mimiciv_hosp.prescriptions pr
@@ -132,8 +132,8 @@ WITH co AS (
         co.hr,
         MAX(CASE
             WHEN dm.on_delirium_med = 1
-                 AND CAST(co.starttime AS DATE) >= dm.startdate
-                 AND CAST(co.starttime AS DATE) <= COALESCE(dm.stopdate, CAST(co.starttime AS DATE) + INTERVAL '1' DAY)
+                 AND (co.starttime)::date >= dm.startdate
+                 AND (co.starttime)::date <= COALESCE(dm.stopdate, (co.starttime)::date + INTERVAL '1' DAY)
             THEN 1
             ELSE 0
         END) AS on_delirium_med

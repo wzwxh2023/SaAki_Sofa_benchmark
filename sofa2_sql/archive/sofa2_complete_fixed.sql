@@ -1,6 +1,5 @@
 -- =================================================================
 -- SOFA-2 完整评分脚本（修复版本）
--- 基于数据库验证修复了表名和itemid问题
 -- 整合了所有修复：呼吸评分完整实现，其他组件保持原有逻辑
 -- =================================================================
 
@@ -102,161 +101,68 @@ WITH co AS (
     WHERE gcs.gcs IS NOT NULL  -- 只要有GCS记录就保留
 )
 
--- 步骤2.5: 为每个GCS记录标记镇静状态（关键修复）
-, gcs_with_sedation_status AS (
-    SELECT
-        gc.stay_id,
-        gc.charttime,
-        gc.gcs_clean,
-        gc.gcs_motor_clean,
-        gc.gcs_verbal_clean,
-        gc.gcs_eyes_clean,
-        gc.is_complete,
-        -- 检测在GCS记录时间点是否使用了镇静药物
-        MAX(CASE
-            WHEN pr.starttime <= gc.charttime
-            AND COALESCE(pr.stoptime, gc.charttime) >= gc.charttime
-            AND LOWER(pr.drug) LIKE ANY(ARRAY[
-                '%propofol%', '%midazolam%', '%lorazepam%', '%diazepam%',
-                '%fentanyl%', '%remifentanil%', '%morphine%', '%hydromorphone%',
-                '%dexmedetomidine%'
-            ])
-            THEN 1 ELSE 0
-        END) AS on_sedation_meds_at_gcs,
-        -- 检测在GCS记录时间点是否使用了肌松药物
-        MAX(CASE
-            WHEN pr.starttime <= gc.charttime
-            AND COALESCE(pr.stoptime, gc.charttime) >= gc.charttime
-            AND LOWER(pr.drug) LIKE ANY(ARRAY[
-                '%cisatracurium%', '%vecuronium%', '%rocuronium%', '%atracurium%',
-                '%succinylcholine%', '%pancuronium%'
-            ])
-            THEN 1 ELSE 0
-        END) AS on_paralytics_at_gcs,
-        -- 检测在GCS记录时间点的RASS评分
-        MAX(CASE
-            WHEN ce.charttime = gc.charttime
-            AND ce.itemid IN (223900, 220739)
-            AND ce.valuenum IS NOT NULL
-            AND CAST(ce.valuenum AS NUMERIC) <= -4
-            THEN 1 ELSE 0
-        END) AS deep_sedation_at_gcs
-    FROM gcs_clean gc
-    LEFT JOIN mimiciv_icu.icustays icu
-        ON gc.stay_id = icu.stay_id
-    LEFT JOIN mimiciv_hosp.prescriptions pr
-        ON icu.hadm_id = pr.hadm_id
-    LEFT JOIN mimiciv_icu.chartevents ce
-        ON gc.stay_id = ce.stay_id
-        AND ce.charttime = gc.charttime
-        AND ce.itemid IN (223900, 220739)
-    GROUP BY gc.stay_id, gc.charttime, gc.gcs_clean, gc.gcs_motor_clean,
-             gc.gcs_verbal_clean, gc.gcs_eyes_clean, gc.is_complete
-)
-
--- 步骤3: 智能GCS选择（镇静前回溯修复）
-, gcs_forward_fill AS (
+, gcs_hourly_stats AS (
     SELECT
         co.stay_id,
         co.hr,
-        co.starttime,
-        co.endtime,
-        gcs_lookup.nearest_gcs,
-        gcs_lookup.nearest_motor,
-        gcs_lookup.nearest_verbal,
-        gcs_lookup.nearest_eyes,
-        gcs_lookup.is_sedated_at_selected_gcs,
-        gcs_lookup.has_current_gcs,
-        gcs_lookup.selected_gcs_time
+        MIN(gcs_clean) AS gcs_min_in_hour,
+        MIN(gcs_motor_clean) AS motor_min_in_hour,
+        MIN(gcs_verbal_clean) AS verbal_min_in_hour,
+        MIN(gcs_eyes_clean) AS eyes_min_in_hour,
+        MAX(CASE
+            WHEN gcs.charttime >= co.starttime AND gcs.charttime < co.endtime
+            THEN 1 ELSE 0
+        END) AS has_current_gcs
+    FROM co
+    LEFT JOIN gcs_clean gcs
+        ON gcs.stay_id = co.stay_id
+        AND gcs.charttime >= co.starttime
+        AND gcs.charttime < co.endtime
+    GROUP BY co.stay_id, co.hr
+)
+
+, gcs_last_prior AS (
+    SELECT
+        co.stay_id,
+        co.hr,
+        g_prev.gcs_clean AS gcs_last_prior,
+        g_prev.gcs_motor_clean AS motor_last_prior,
+        g_prev.gcs_verbal_clean AS verbal_last_prior,
+        g_prev.gcs_eyes_clean AS eyes_last_prior
     FROM co
     LEFT JOIN LATERAL (
-        -- 智能GCS选择逻辑：如果当前镇静，回溯到最近非镇静的GCS
-        WITH current_hour_sedation AS (
-            SELECT
-                MAX(COALESCE(on_sedation_meds, 0)) as sedation_flag,
-                MAX(COALESCE(on_paralytics, 0)) as paralytics_flag,
-                MAX(COALESCE(deep_sedation, 0)) as deep_sedation_flag
-            FROM sedation_detection sd
-            WHERE sd.stay_id = co.stay_id AND sd.hr = co.hr
-        ),
-        gcs_candidates AS (
-            SELECT
-                gss.charttime,
-                gss.gcs_clean,
-                gss.gcs_motor_clean,
-                gss.gcs_verbal_clean,
-                gss.gcs_eyes_clean,
-                gss.is_complete,
-                gss.on_sedation_meds_at_gcs,
-                gss.on_paralytics_at_gcs,
-                gss.deep_sedation_at_gcs,
-                -- 标记是否镇静状态
-                CASE WHEN (gss.on_sedation_meds_at_gcs = 1
-                         OR gss.on_paralytics_at_gcs = 1
-                         OR gss.deep_sedation_at_gcs = 1)
-                     THEN 1 ELSE 0 END as is_sedated
-            FROM gcs_with_sedation_status gss
-            WHERE gss.stay_id = co.stay_id
-              AND gss.charttime <= co.endtime
-              AND gss.is_complete = 1  -- 只要完整的GCS记录
-        ),
-        final_selection AS (
-            SELECT
-                charttime,
-                gcs_clean,
-                gcs_motor_clean,
-                gcs_verbal_clean,
-                gcs_eyes_clean,
-                is_sedated,
-                -- 标记当前小时内是否有GCS
-                CASE WHEN charttime >= co.starttime AND charttime < co.endtime
-                     THEN 1 ELSE 0 END as is_current_hour
-            FROM gcs_candidates
-            ORDER BY
-                -- 优先级1: 如果当前小时有非镇静GCS，优先选择
-                CASE WHEN is_current_hour = 1 AND is_sedated = 0 THEN 0 ELSE 1 END,
-                -- 优先级2: 非镇静状态优先
-                is_sedated,
-                -- 优先级3: 时间最近优先
-                charttime DESC
-            LIMIT 1
-        )
         SELECT
-            gcs_clean AS nearest_gcs,
-            gcs_motor_clean AS nearest_motor,
-            gcs_verbal_clean AS nearest_verbal,
-            gcs_eyes_clean AS nearest_eyes,
-            is_sedated AS is_sedated_at_selected_gcs,
-            is_current_hour AS has_current_gcs,
-            charttime AS selected_gcs_time
-        FROM final_selection
-    ) gcs_lookup ON TRUE
+            gcs_clean,
+            gcs_motor_clean,
+            gcs_verbal_clean,
+            gcs_eyes_clean
+        FROM gcs_clean gcs_prev
+        WHERE gcs_prev.stay_id = co.stay_id
+            AND gcs_prev.charttime < co.starttime
+        ORDER BY gcs_prev.charttime DESC
+        LIMIT 1
+    ) g_prev ON TRUE
 )
 
 -- 步骤4: 最终GCS数据处理
 , gcs_final AS (
     SELECT
-        stay_id,
-        hr,
-        nearest_gcs AS gcs_min,
-        nearest_motor AS motor_component,
-        nearest_verbal AS verbal_component,
-        nearest_eyes AS eyes_component,
-        has_current_gcs,
-        is_sedated_at_selected_gcs,
-        selected_gcs_time,
-        CASE
-            -- 如果没有可用GCS数据
-            WHEN nearest_gcs IS NULL THEN NULL
-            -- 如果有完整的GCS记录，使用总分
-            WHEN nearest_motor IS NOT NULL AND nearest_verbal IS NOT NULL AND nearest_eyes IS NOT NULL
-            THEN nearest_gcs
-            -- 如果缺失组件，使用运动评分（SOFA-2 fallback规则）
-            WHEN nearest_motor IS NOT NULL THEN nearest_motor
-            ELSE NULL
-        END AS effective_gcs
-    FROM gcs_forward_fill
-    WHERE (has_current_gcs = 1 OR nearest_gcs IS NOT NULL)  -- 确保有GCS数据才保留
+        co.stay_id,
+        co.hr,
+        ghs.gcs_min_in_hour,
+        ghs.motor_min_in_hour,
+        ghs.verbal_min_in_hour,
+        ghs.eyes_min_in_hour,
+        ghs.has_current_gcs,
+        glp.gcs_last_prior,
+        glp.motor_last_prior,
+        glp.verbal_last_prior,
+        glp.eyes_last_prior
+    FROM co
+    LEFT JOIN gcs_hourly_stats ghs
+        ON co.stay_id = ghs.stay_id AND co.hr = ghs.hr
+    LEFT JOIN gcs_last_prior glp
+        ON co.stay_id = glp.stay_id AND co.hr = glp.hr
 )
 
 -- 步骤5: 谵妄药物检测
@@ -265,8 +171,8 @@ WITH co AS (
         co.stay_id,
         co.hr,
         MAX(CASE
-            WHEN pr.starttime::date <= co.endtime::date
-            AND COALESCE(pr.stoptime::date, co.endtime::date) >= co.starttime::date
+            WHEN pr.starttime <= co.endtime
+            AND COALESCE(pr.stoptime, co.endtime) >= co.starttime
             AND LOWER(pr.drug) LIKE ANY(ARRAY[
                 '%haloperidol%', '%haldol%', '%quetiapine%', '%seroquel%',
                 '%olanzapine%', '%zyprexa%', '%risperidone%', '%risperdal%',
@@ -298,37 +204,51 @@ WITH co AS (
 
     UNION ALL
 
-    -- 方法2: 从chartevents获取CPAP/BiPAP/HFNC支持
+    -- 方法2: 从chartevents获取CPAP/BiPAP支持
     SELECT
         ce.stay_id,
         ce.charttime AS starttime,
         ce.charttime + INTERVAL '5 MINUTE' AS endtime,  -- 假设单次记录代表5分钟支持
         CASE
-            WHEN ce.itemid IN (227583, 227287) THEN 'CPAP'
-            WHEN ce.itemid IN (227577, 227578, 227579, 227580, 227581, 227582, 227288) THEN 'BiPAP'
-            -- WHEN ce.itemid IN (226708) THEN 'HFNC'  -- itemid不存在，已删除
-            ELSE 'Other_High_Support'
+            WHEN ce.itemid IN (227583) THEN 'CPAP'
+            WHEN ce.itemid IN (227577, 227578, 227579, 227580, 227581, 227582) THEN 'BiPAP'
+            ELSE 'Other_NIV'
         END AS ventilation_status,
         1 AS has_advanced_support,
         'chartevents_cpap' AS source
     FROM mimiciv_icu.chartevents ce
-    WHERE ce.itemid IN (227287, 227288, 227577, 227578, 227579, 227580, 227581, 227582, 227583)
+    WHERE ce.itemid IN (227577, 227578, 227579, 227580, 227581, 227582, 227583)
       AND ce.valuenum IS NOT NULL
       AND (ce.valuenum > 0 OR ce.value IS NOT NULL)
+
+    UNION ALL
+
+    -- 方法3: 检测氧疗设备支持（补充）
+    SELECT DISTINCT
+        ce.stay_id,
+        ce.charttime AS starttime,
+        ce.charttime + INTERVAL '10 MINUTE' AS endtime,  -- 设备设置假设持续10分钟
+        'O2_Delivery' AS ventilation_status,
+        1 AS has_advanced_support,
+        'oxygen_device' AS source
+    FROM mimiciv_icu.chartevents ce
+    WHERE ce.itemid IN (
+        226708,  -- High Flow Nasal Cannula settings
+        227287,  -- CPAP pressure
+        227288,  -- BiPAP settings
+        223835,  -- O2 Flow
+        50816    -- Supplemental O2
+    )
+    AND ce.valuenum > 0
 )
 
--- 高级呼吸支持时间窗口合并（避免短暂事件漏标）
 , advanced_support_sessions AS (
     SELECT
         stay_id,
         ventilation_status,
         starttime,
         endtime,
-        SUM(new_session) OVER (
-            PARTITION BY stay_id, ventilation_status
-            ORDER BY starttime
-            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-        ) AS session_id
+        SUM(new_session) OVER (PARTITION BY stay_id, ventilation_status ORDER BY starttime) AS session_id
     FROM (
         SELECT
             stay_id,
@@ -336,16 +256,14 @@ WITH co AS (
             starttime,
             endtime,
             CASE
-                WHEN starttime - LAG(endtime) OVER (
-                    PARTITION BY stay_id, ventilation_status
-                    ORDER BY starttime
-                ) <= INTERVAL '30 MINUTE'
+                WHEN starttime - LAG(endtime) OVER (PARTITION BY stay_id, ventilation_status ORDER BY starttime) <= INTERVAL '30 MINUTE'
                 THEN 0
                 ELSE 1
             END AS new_session
         FROM advanced_resp_support
-    ) ordered_events
+    ) events_with_sessions
 )
+
 , advanced_support_merged AS (
     SELECT
         stay_id,
@@ -371,11 +289,10 @@ WITH co AS (
         END) AS any_advanced_support_in_hour,
         -- 计算高级呼吸支持持续时间（分钟）
         SUM(
-            GREATEST(
-                EXTRACT(EPOCH FROM (
-                    LEAST(asm.event_endtime, co.endtime) - GREATEST(asm.event_starttime, co.starttime)
-                )),
-                0
+            GREATEST(0,
+                EXTRACT(
+                    EPOCH FROM LEAST(asm.event_endtime, co.endtime) - GREATEST(asm.event_starttime, co.starttime)
+                )
             )
         ) / 60 AS advanced_support_minutes_in_hour
     FROM co
@@ -384,17 +301,6 @@ WITH co AS (
         AND asm.event_starttime < co.endtime
         AND asm.event_endtime > co.starttime
     GROUP BY co.stay_id, co.hr, co.starttime, co.endtime
-)
-
--- ECMO机械支持检测（基于数据库验证的有效方法）
-, mechanical_support AS (
-    SELECT DISTINCT
-        ce.stay_id,
-        ce.charttime,
-        'ECMO' AS device_type,
-        1 AS has_mechanical_support
-    FROM mimiciv_icu.chartevents ce
-    WHERE ce.itemid = 224660  -- 仅保留有效的ECMO检测itemid
 )
 
 -- 血气数据
@@ -471,7 +377,7 @@ WITH co AS (
             THEN MIN(spo2.spo2) / MAX(fio2.fio2)
             ELSE NULL
         END AS sfi_ratio,
-        COALESCE(MAX(rtw.any_advanced_support_in_hour), 0) AS has_advanced_support
+        MAX(asm.has_advanced_support) AS has_advanced_support
     FROM co
     LEFT JOIN spo2_data spo2
         ON co.stay_id = spo2.stay_id
@@ -481,9 +387,9 @@ WITH co AS (
         ON co.stay_id = fio2.stay_id
         AND fio2.charttime >= co.starttime
         AND fio2.charttime < co.endtime
-    LEFT JOIN respiratory_time_windows rtw
-        ON co.stay_id = rtw.stay_id
-        AND co.hr = rtw.hr
+    LEFT JOIN advanced_support_merged asm
+        ON co.stay_id = asm.stay_id
+        AND (asm.event_starttime < co.endtime AND asm.event_endtime > co.starttime)
     GROUP BY co.stay_id, co.hr
 )
 
@@ -499,12 +405,7 @@ WITH co AS (
         MIN(sfi.sfi_ratio) AS sfi_ratio,
         MIN(sfi.spo2_min) AS spo2_min,  -- 更新为spo2_min
         -- 高级呼吸支持状态
-        COALESCE(
-            MAX(pafi.on_advanced_support),
-            MAX(sfi.has_advanced_support),
-            MAX(rtw.any_advanced_support_in_hour),
-            0
-        ) AS has_advanced_support,
+        COALESCE(MAX(pafi.on_advanced_support), MAX(sfi.has_advanced_support), 0) AS has_advanced_support,
         -- SOFA-2逻辑：优先使用PF ratio，不可用时才用SF ratio
         CASE
             -- 当血气数据可用时（PaO2和FiO2都能形成ratio）
@@ -529,82 +430,45 @@ WITH co AS (
         AND pafi.charttime < co.endtime
     LEFT JOIN sfi_data sfi
         ON co.stay_id = sfi.stay_id AND co.hr = sfi.hr
-    LEFT JOIN respiratory_time_windows rtw
-        ON co.stay_id = rtw.stay_id AND co.hr = rtw.hr
     GROUP BY co.stay_id, co.hr
 )
 
--- ECMO检测（仅保留验证有效的方法2和4）
+-- ECMO检测（SOFA-2兼容的全面检测）
 , ecmo_resp AS (
     SELECT DISTINCT
         co.stay_id,
         co.hr,
         MAX(CASE
-            -- 方法2: 通过机械支持表检测ECMO（验证有效）
+            -- 方法1: 直接ECMO状态指示器
+            WHEN ce.charttime >= co.starttime AND ce.charttime < co.endtime
+            AND ce.itemid IN (229815, 229816) AND ce.valuenum = 1 THEN 1
+            -- 方法2: 通过机械支持表检测ECMO
             WHEN ms.has_mechanical_support = 1 AND ms.device_type = 'ECMO'
                  AND ms.charttime >= co.starttime AND ms.charttime < co.endtime THEN 1
-            -- 方法4: 通过procedureevents检测ECMO操作（验证有效）
-            WHEN pe.starttime < co.endtime
-                 AND COALESCE(pe.endtime, pe.starttime) > co.starttime
-                 AND pe.itemid IN (229529, 229530)  -- ECMO Inflow/Outflow Line
-            THEN 1
+            -- 方法3: 通过通气状态检测ECMO相关模式
+            WHEN v.ventilation_status ILIKE '%ECMO%'
+                 AND v.starttime < co.endtime AND COALESCE(v.endtime, co.endtime) > co.starttime THEN 1
+            -- 方法4: 通过procedureevents检测ECMO操作
+            WHEN pe.charttime >= co.starttime AND pe.charttime < co.endtime
+            AND LOWER(pe.itemid::text) LIKE ANY(ARRAY[
+                '%ecmo%', '%extracorporeal%', '%membrane%'
+            ]) THEN 1
             ELSE 0
         END) AS on_ecmo
     FROM co
+    LEFT JOIN mimiciv_icu.chartevents ce
+        ON co.stay_id = ce.stay_id
     LEFT JOIN mechanical_support ms
         ON co.stay_id = ms.stay_id
+    LEFT JOIN mimiciv_derived.ventilation v
+        ON co.stay_id = v.stay_id
     LEFT JOIN mimiciv_icu.procedureevents pe
         ON co.stay_id = pe.stay_id
-    WHERE ms.device_type = 'ECMO'
-       OR pe.itemid IN (229529, 229530)
-    GROUP BY co.stay_id, co.hr
-)
-
--- =================================================================
--- SECTION 3: CARDIOVASCULAR (简化版本)
--- =================================================================
-, vs AS (
-    SELECT DISTINCT
-        co.stay_id, co.hr
-        , MIN(vs.mbp) AS mbp_min
-    FROM co
-    LEFT JOIN mimiciv_derived.vitalsign vs
-        ON co.stay_id = vs.stay_id
-            AND vs.charttime >= co.starttime
-            AND vs.charttime < co.endtime
-    GROUP BY co.stay_id, co.hr
-)
-
-, vaso_primary AS (
-    SELECT
-        co.stay_id,
-        co.hr,
-        MAX(va.norepinephrine) AS rate_norepinephrine,
-        MAX(va.epinephrine) AS rate_epinephrine,
-        MAX(va.dopamine) AS rate_dopamine,
-        MAX(va.dobutamine) AS rate_dobutamine,
-        MAX(va.vasopressin) AS rate_vasopressin,
-        MAX(va.phenylephrine) AS rate_phenylephrine,
-        MAX(va.milrinone) AS rate_milrinone
-    FROM co
-    LEFT JOIN mimiciv_derived.vasoactive_agent va
-        ON co.stay_id = va.stay_id
-        AND va.starttime < co.endtime
-        AND COALESCE(va.endtime, co.endtime) > co.starttime
-    GROUP BY co.stay_id, co.hr
-)
-
--- 机械循环支持按小时聚合（供心血管评分使用）
-, mech_support_hourly AS (
-    SELECT
-        co.stay_id,
-        co.hr,
-        MAX(ms.has_mechanical_support) AS has_mechanical_support
-    FROM co
-    LEFT JOIN mechanical_support ms
-        ON co.stay_id = ms.stay_id
-        AND ms.charttime >= co.starttime
-        AND ms.charttime < co.endtime
+    WHERE
+        ce.itemid IN (229815, 229816)  -- ECMO状态itemid
+        OR ms.device_type = 'ECMO'
+        OR v.ventilation_status ILIKE '%ECMO%'
+        OR LOWER(pe.itemid::text) LIKE ANY(ARRAY['%ecmo%', '%extracorporeal%', '%membrane%'])
     GROUP BY co.stay_id, co.hr
 )
 
@@ -650,7 +514,7 @@ WITH co AS (
     GROUP BY co.stay_id, co.hr
 )
 
--- 患者体重（用于基于体重的尿量计算）- 修复表名
+-- 患者体重（用于基于体重的尿量计算）
 , patient_weight AS (
     SELECT
         stay_id,
@@ -660,10 +524,71 @@ WITH co AS (
 )
 
 -- RRT检测
+, rrt_active AS (
+    SELECT
+        stay_id,
+        charttime,
+        dialysis_active AS on_rrt
+    FROM mimiciv_derived.rrt
+    WHERE dialysis_active = 1
+)
+
 -- RRT代谢标准
+, rrt_metabolic_criteria AS (
+    SELECT
+        co.stay_id,
+        co.hr,
+        cr.creatinine_max,
+        k.potassium_max,
+        bg.ph_min,
+        bg.bicarbonate_min,
+        CASE
+            WHEN cr.creatinine_max > 1.2
+                 AND (k.potassium_max >= 6.0
+                      OR (bg.ph_min <= 7.2 AND bg.bicarbonate_min <= 12))
+            THEN 1
+            ELSE 0
+        END AS meets_rrt_criteria
+    FROM co
+    LEFT JOIN (
+        SELECT ie.stay_id, chem.charttime, MAX(chem.creatinine) AS creatinine_max
+        FROM mimiciv_icu.icustays ie
+        INNER JOIN mimiciv_derived.chemistry chem
+            ON ie.subject_id = chem.subject_id
+            AND chem.charttime >= ie.intime
+            AND chem.charttime < ie.outtime
+        GROUP BY ie.stay_id, chem.charttime
+    ) cr ON co.stay_id = cr.stay_id
+        AND cr.charttime >= co.starttime
+        AND cr.charttime < co.endtime
+    LEFT JOIN (
+        SELECT ie.stay_id, chem.charttime, MAX(chem.potassium) AS potassium_max
+        FROM mimiciv_icu.icustays ie
+        INNER JOIN mimiciv_derived.chemistry chem
+            ON ie.subject_id = chem.subject_id
+            AND chem.charttime >= ie.intime
+            AND chem.charttime < ie.outtime
+        GROUP BY ie.stay_id, chem.charttime
+    ) k ON co.stay_id = k.stay_id
+        AND k.charttime >= co.starttime
+        AND k.charttime < co.endtime
+    LEFT JOIN (
+        SELECT ie.stay_id, bg.charttime, MIN(bg.ph) AS ph_min, MIN(bg.bicarbonate) AS bicarbonate_min
+        FROM mimiciv_icu.icustays ie
+        INNER JOIN mimiciv_derived.bg bg
+            ON ie.subject_id = bg.subject_id
+            AND bg.charttime >= ie.intime
+            AND bg.charttime < ie.outtime
+        WHERE bg.specimen = 'ART.'
+        GROUP BY ie.stay_id, bg.charttime
+    ) bg ON co.stay_id = bg.stay_id
+        AND bg.charttime >= co.starttime
+        AND bg.charttime < co.endtime
+)
+
 -- SOFA-2 肾脏评分：精确连续尿量分析
 , uo_continuous AS (
-    -- 步骤1: 原始尿量数据与体重 - 修复表名引用
+    -- 步骤1: 原始尿量数据与体重
     WITH uo_raw AS (
         SELECT
             u.stay_id,
@@ -776,19 +701,16 @@ uo_max_durations AS (
 )
 
 , rrt_status AS (
-    SELECT
+    SELECT DISTINCT
         co.stay_id,
         co.hr,
-        COALESCE(rrt_state.dialysis_active, 0) AS on_rrt
+        MAX(rrt.on_rrt) AS on_rrt
     FROM co
-    LEFT JOIN LATERAL (
-        SELECT r.dialysis_active
-        FROM mimiciv_derived.rrt r
-        WHERE r.stay_id = co.stay_id
-          AND r.charttime <= co.endtime
-        ORDER BY r.charttime DESC
-        LIMIT 1
-    ) rrt_state ON TRUE
+    LEFT JOIN rrt_active rrt
+        ON co.stay_id = rrt.stay_id
+        AND rrt.charttime >= co.starttime
+        AND rrt.charttime < co.endtime
+    GROUP BY co.stay_id, co.hr
 )
 
 -- =================================================================
@@ -807,6 +729,35 @@ uo_max_durations AS (
 )
 
 -- =================================================================
+-- SECTION 3: CARDIOVASCULAR (简化版本)
+-- =================================================================
+, vs AS (
+    SELECT DISTINCT
+        co.stay_id, co.hr
+        , MIN(vs.mbp) AS mbp_min
+    FROM co
+    LEFT JOIN mimiciv_derived.vitalsign vs
+        ON co.stay_id = vs.stay_id
+            AND vs.charttime >= co.starttime
+            AND vs.charttime < co.endtime
+    GROUP BY co.stay_id, co.hr
+)
+
+, vaso_primary AS (
+    SELECT DISTINCT
+        co.stay_id,
+        co.hr,
+        MAX(va.norepinephrine) AS rate_norepinephrine,
+        MAX(va.epinephrine) AS rate_epinephrine
+    FROM co
+    LEFT JOIN mimiciv_derived.vasoactive_agent va
+        ON co.stay_id = va.stay_id
+        AND va.starttime < co.endtime
+        AND COALESCE(va.endtime, co.endtime) > co.starttime
+    GROUP BY co.stay_id, co.hr
+)
+
+-- =================================================================
 -- 综合评分计算
 -- =================================================================
 , scorecomp AS (
@@ -818,10 +769,34 @@ uo_max_durations AS (
         co.starttime,
         co.endtime,
         -- Brain/Neurological (SOFA-2 Compliant)
-        gf.effective_gcs AS gcs_min,
+        gf.gcs_min_in_hour,
+        gf.motor_min_in_hour,
+        gf.gcs_last_prior,
+        gf.motor_last_prior,
         sd.on_sedation_meds,
         sd.on_paralytics,
         sd.deep_sedation,
+        CASE
+            WHEN COALESCE(sd.on_sedation_meds, 0) = 1
+                OR COALESCE(sd.on_paralytics, 0) = 1
+                OR COALESCE(sd.deep_sedation, 0) = 1
+            THEN 1 ELSE 0
+        END AS sedation_or_paralytic,
+        CASE
+            WHEN gf.gcs_min_in_hour IS NOT NULL THEN gf.gcs_min_in_hour
+            WHEN (COALESCE(sd.on_sedation_meds, 0) = 1
+                OR COALESCE(sd.on_paralytics, 0) = 1
+                OR COALESCE(sd.deep_sedation, 0) = 1)
+                AND gf.gcs_last_prior IS NOT NULL
+            THEN gf.gcs_last_prior
+            WHEN (COALESCE(sd.on_sedation_meds, 0) = 1
+                OR COALESCE(sd.on_paralytics, 0) = 1
+                OR COALESCE(sd.deep_sedation, 0) = 1)
+                AND gf.motor_last_prior IS NOT NULL
+            THEN gf.motor_last_prior
+            WHEN gf.motor_min_in_hour IS NOT NULL THEN gf.motor_min_in_hour
+            ELSE NULL
+        END AS effective_brain_gcs,
         bd.on_delirium_med,
         -- Respiratory
         rd.pf_novent_min,
@@ -834,12 +809,6 @@ uo_max_durations AS (
         vs.mbp_min,
         vp.rate_norepinephrine,
         vp.rate_epinephrine,
-        vp.rate_dopamine,
-        vp.rate_dobutamine,
-        vp.rate_vasopressin,
-        vp.rate_phenylephrine,
-        vp.rate_milrinone,
-        COALESCE(ms.has_mechanical_support, 0) AS has_mechanical_support,
         -- Liver
         bili.bilirubin_max,
         -- Kidney
@@ -847,6 +816,7 @@ uo_max_durations AS (
         cr.potassium_max,
         bgm.ph_min,
         bgm.bicarbonate_min,
+        rmc.meets_rrt_criteria,
         uod.max_hours_low_05,
         uod.max_hours_low_03,
         uod.max_hours_anuria,
@@ -855,17 +825,19 @@ uo_max_durations AS (
         plt.platelet_min,
         -- Brain component (SOFA-2 Compliant)
         CASE
+            -- 镇静/肌松且缺少镇静前记录，默认0分
+            WHEN sedation_or_paralytic = 1 AND effective_brain_gcs IS NULL THEN 0
             -- 正常GCS评分逻辑
-            WHEN effective_gcs <= 5 THEN 4
-            WHEN effective_gcs BETWEEN 6 AND 8 THEN 3
-            WHEN effective_gcs BETWEEN 9 AND 12 THEN 2
-            WHEN effective_gcs BETWEEN 13 AND 14 THEN 1
+            WHEN effective_brain_gcs <= 5 THEN 4
+            WHEN effective_brain_gcs BETWEEN 6 AND 8 THEN 3
+            WHEN effective_brain_gcs BETWEEN 9 AND 12 THEN 2
+            WHEN effective_brain_gcs BETWEEN 13 AND 14 THEN 1
             -- GCS = 15 且无谵妄药物时为0分
-            WHEN effective_gcs = 15 AND COALESCE(on_delirium_med, 0) = 0 THEN 0
+            WHEN effective_brain_gcs = 15 AND COALESCE(on_delirium_med, 0) = 0 THEN 0
             -- 任何患者使用谵妄药物最少得1分
             WHEN COALESCE(on_delirium_med, 0) = 1 THEN 1
-            -- 缺失数据情况：无任何可用GCS记录时返回NULL
-            WHEN effective_gcs IS NULL THEN NULL
+            -- 缺失数据默认0分
+            WHEN effective_brain_gcs IS NULL THEN 0
             ELSE 0
         END AS brain,
         -- Respiratory component (SOFA-2原文标准 - 区分PF和SF阈值)
@@ -907,77 +879,11 @@ uo_max_durations AS (
         END AS respiratory,
         -- Cardiovascular component (简化版本)
         CASE
-            -- 4分：机械循环支持或NE/Epi高剂量
-            WHEN COALESCE(has_mechanical_support, 0) = 1 THEN 4
-            WHEN (COALESCE(rate_norepinephrine, 0) + COALESCE(rate_epinephrine, 0)) > 0.4 THEN 4
-            -- 4分：中剂量NE/Epi + 其他升压/正性肌力药
-            WHEN (COALESCE(rate_norepinephrine, 0) + COALESCE(rate_epinephrine, 0)) > 0.2
-                 AND (COALESCE(rate_norepinephrine, 0) + COALESCE(rate_epinephrine, 0)) <= 0.4
-                 AND (
-                    COALESCE(rate_dopamine, 0) > 0
-                    OR COALESCE(rate_dobutamine, 0) > 0
-                    OR COALESCE(rate_vasopressin, 0) > 0
-                    OR COALESCE(rate_phenylephrine, 0) > 0
-                    OR COALESCE(rate_milrinone, 0) > 0
-                 ) THEN 4
-            -- 3分：中剂量NE/Epi
-            WHEN (COALESCE(rate_norepinephrine, 0) + COALESCE(rate_epinephrine, 0)) > 0.2
-                 AND (COALESCE(rate_norepinephrine, 0) + COALESCE(rate_epinephrine, 0)) <= 0.4 THEN 3
-            -- 3分：低剂量NE/Epi + 其他药
-            WHEN (COALESCE(rate_norepinephrine, 0) + COALESCE(rate_epinephrine, 0)) > 0
-                 AND (COALESCE(rate_norepinephrine, 0) + COALESCE(rate_epinephrine, 0)) <= 0.2
-                 AND (
-                    COALESCE(rate_dopamine, 0) > 0
-                    OR COALESCE(rate_dobutamine, 0) > 0
-                    OR COALESCE(rate_vasopressin, 0) > 0
-                    OR COALESCE(rate_phenylephrine, 0) > 0
-                    OR COALESCE(rate_milrinone, 0) > 0
-                 ) THEN 3
-            -- 2分：低剂量NE/Epi
-            WHEN (COALESCE(rate_norepinephrine, 0) + COALESCE(rate_epinephrine, 0)) > 0
-                 AND (COALESCE(rate_norepinephrine, 0) + COALESCE(rate_epinephrine, 0)) <= 0.2 THEN 2
-            -- 多巴胺单药评分
-            WHEN COALESCE(rate_dopamine, 0) > 40
-                 AND (COALESCE(rate_norepinephrine, 0) + COALESCE(rate_epinephrine, 0)) = 0
-                 AND COALESCE(rate_dobutamine, 0) = 0
-                 AND COALESCE(rate_vasopressin, 0) = 0
-                 AND COALESCE(rate_phenylephrine, 0) = 0
-                 AND COALESCE(rate_milrinone, 0) = 0 THEN 4
-            WHEN COALESCE(rate_dopamine, 0) > 20
-                 AND (COALESCE(rate_norepinephrine, 0) + COALESCE(rate_epinephrine, 0)) = 0
-                 AND COALESCE(rate_dobutamine, 0) = 0
-                 AND COALESCE(rate_vasopressin, 0) = 0
-                 AND COALESCE(rate_phenylephrine, 0) = 0
-                 AND COALESCE(rate_milrinone, 0) = 0 THEN 3
-            WHEN COALESCE(rate_dopamine, 0) > 0
-                 AND (COALESCE(rate_norepinephrine, 0) + COALESCE(rate_epinephrine, 0)) = 0
-                 AND COALESCE(rate_dobutamine, 0) = 0
-                 AND COALESCE(rate_vasopressin, 0) = 0
-                 AND COALESCE(rate_phenylephrine, 0) = 0
-                 AND COALESCE(rate_milrinone, 0) = 0 THEN 2
-            -- 2分：其他升压/正性肌力药
-            WHEN COALESCE(rate_dobutamine, 0) > 0
-                 OR COALESCE(rate_vasopressin, 0) > 0
-                 OR COALESCE(rate_phenylephrine, 0) > 0
-                 OR COALESCE(rate_milrinone, 0) > 0
-                 OR COALESCE(rate_dopamine, 0) > 0 THEN 2
-            -- 替代评分：仅在无血管活性药物数据时使用MAP评分
-            WHEN mbp_min IS NOT NULL
-                 AND COALESCE(rate_norepinephrine, 0) = 0
-                 AND COALESCE(rate_epinephrine, 0) = 0
-                 AND COALESCE(rate_dopamine, 0) = 0
-                 AND COALESCE(rate_dobutamine, 0) = 0
-                 AND COALESCE(rate_vasopressin, 0) = 0
-                 AND COALESCE(rate_phenylephrine, 0) = 0
-                 AND COALESCE(rate_milrinone, 0) = 0 THEN
-                CASE
-                    WHEN mbp_min >= 70 THEN 0
-                    WHEN mbp_min >= 60 THEN 1
-                    WHEN mbp_min >= 50 THEN 2
-                    WHEN mbp_min >= 40 THEN 3
-                    ELSE 4
-                END
-            ELSE NULL
+            WHEN mbp_min < 70 THEN 1
+            WHEN COALESCE(rate_norepinephrine, 0) > 0 OR COALESCE(rate_epinephrine, 0) > 0 THEN 2
+            WHEN COALESCE(mbp_min, 0) = 0 AND
+                 COALESCE(rate_norepinephrine, 0) = 0 AND COALESCE(rate_epinephrine, 0) = 0 THEN NULL
+            ELSE 0
         END AS cardiovascular,
         -- Liver component
         CASE
@@ -993,33 +899,21 @@ uo_max_durations AS (
         CASE
             -- 4 points: 正在接受或符合RRT标准
             WHEN on_rrt = 1 THEN 4
-            WHEN (
-                (
-                    COALESCE(creatinine_max, 0) > 1.2
-                    OR COALESCE(max_hours_low_03, 0) >= 6
-                )
-                AND (
-                    COALESCE(potassium_max, 0) >= 6.0
-                    OR (
-                        COALESCE(ph_min, 7.3) <= 7.2
-                        AND COALESCE(bicarbonate_min, 100) <= 12
-                    )
-                )
-            ) THEN 4
+            WHEN meets_rrt_criteria = 1 THEN 4
             -- 3 points: 肌酐 >3.5 mg/dL 或严重少尿/无尿
-            WHEN cr.creatinine_max > 3.5 THEN 3
-            WHEN uod.max_hours_low_03 >= 24 THEN 3  -- <0.3 ml/kg/h 持续 ≥24h
-            WHEN uod.max_hours_anuria >= 12 THEN 3      -- 完全无尿 ≥12h
+            WHEN creatinine_max > 3.5 THEN 3
+            WHEN max_hours_low_03 >= 24 THEN 3  -- <0.3 ml/kg/h 持续 ≥24h
+            WHEN max_hours_anuria >= 12 THEN 3      -- 完全无尿 ≥12h
             -- 2 points: 肌酐 2.0-3.5 mg/dL 或中度少尿 (≥12h)
-            WHEN cr.creatinine_max > 2.0 AND cr.creatinine_max <= 3.5 THEN 2
-            WHEN uod.max_hours_low_05 >= 12 THEN 2      -- <0.5 ml/kg/h 持续 ≥12h
+            WHEN creatinine_max > 2.0 AND creatinine_max <= 3.5 THEN 2
+            WHEN max_hours_low_05 >= 12 THEN 2      -- <0.5 ml/kg/h 持续 ≥12h
             -- 1 point: 肌酐 1.2-2.0 mg/dL 或轻度少尿 (6-12h)
-            WHEN cr.creatinine_max > 1.2 AND cr.creatinine_max <= 2.0 THEN 1
-            WHEN uod.max_hours_low_05 >= 6 AND uod.max_hours_low_05 < 12 THEN 1  -- <0.5 ml/kg/h 持续 6-12h
+            WHEN creatinine_max > 1.2 AND creatinine_max <= 2.0 THEN 1
+            WHEN max_hours_low_05 >= 6 AND max_hours_low_05 < 12 THEN 1  -- <0.5 ml/kg/h 持续 6-12h
             -- 0 points: 肌酐 ≤1.2 mg/dL 和尿量充足
-            WHEN cr.creatinine_max <= 1.2 AND COALESCE(uod.max_hours_low_05, 0) = 0 THEN 0
+            WHEN creatinine_max <= 1.2 AND max_hours_low_05 = 0 THEN 0
             -- 缺失数据情况
-            WHEN COALESCE(cr.creatinine_max, uod.max_hours_low_05) IS NULL THEN NULL
+            WHEN COALESCE(creatinine_max, max_hours_low_05) IS NULL THEN NULL
             ELSE 0
         END AS kidney,
         -- Hemostasis component
@@ -1047,76 +941,20 @@ uo_max_durations AS (
         ON co.stay_id = vs.stay_id AND co.hr = vs.hr
     LEFT JOIN vaso_primary vp
         ON co.stay_id = vp.stay_id AND co.hr = vp.hr
-    LEFT JOIN mech_support_hourly ms
-        ON co.stay_id = ms.stay_id AND co.hr = ms.hr
     LEFT JOIN bili
         ON co.stay_id = bili.stay_id AND co.hr = bili.hr
     LEFT JOIN cr
         ON co.stay_id = cr.stay_id AND co.hr = cr.hr
     LEFT JOIN bg_metabolic bgm
         ON co.stay_id = bgm.stay_id AND co.hr = bgm.hr
+    LEFT JOIN rrt_metabolic_criteria rmc
+        ON co.stay_id = rmc.stay_id AND co.hr = rmc.hr
     LEFT JOIN uo_max_durations uod
         ON co.stay_id = uod.stay_id AND co.hr = uod.hr
     LEFT JOIN rrt_status rrt
         ON co.stay_id = rrt.stay_id AND co.hr = rrt.hr
     LEFT JOIN plt
         ON co.stay_id = plt.stay_id AND co.hr = plt.hr
-)
-
--- =================================================================
--- SOFA-2 最终评分（参考SOFA1的24小时窗口实现）
--- =================================================================
-, score_final AS (
-    SELECT s.*
-        -- Combine all the scores to get SOFA-2
-        -- Impute 0 if the score is missing
-        -- the window function takes the max over the last 24 hours (参考SOFA1官方实现)
-        , COALESCE(
-            MAX(brain) OVER w
-            , 0) AS brain_24hours
-        , COALESCE(
-            MAX(respiratory) OVER w
-            , 0) AS respiratory_24hours
-        , COALESCE(
-            MAX(cardiovascular) OVER w
-            , 0) AS cardiovascular_24hours
-        , COALESCE(
-            MAX(liver) OVER w
-            , 0) AS liver_24hours
-        , COALESCE(
-            MAX(kidney) OVER w
-            , 0) AS kidney_24hours
-        , COALESCE(
-            MAX(hemostasis) OVER w
-            , 0) AS hemostasis_24hours
-
-        -- sum together data for final SOFA-2 (基于24小时窗口最大值)
-        , COALESCE(
-            MAX(brain) OVER w
-            , 0)
-        + COALESCE(
-            MAX(respiratory) OVER w
-            , 0)
-        + COALESCE(
-            MAX(cardiovascular) OVER w
-            , 0)
-        + COALESCE(
-            MAX(liver) OVER w
-            , 0)
-        + COALESCE(
-            MAX(kidney) OVER w
-            , 0)
-        + COALESCE(
-            MAX(hemostasis) OVER w
-            , 0)
-        AS sofa2_24hours
-    FROM scorecomp s
-    WINDOW w AS
-        (
-            PARTITION BY stay_id
-            ORDER BY hr
-            ROWS BETWEEN 23 PRECEDING AND 0 FOLLOWING
-        )
 )
 
 -- =================================================================
@@ -1129,27 +967,18 @@ SELECT
     hr,
     starttime,
     endtime,
-    -- 当前小时的组件评分（原始数据）
+    ratio_type,
+    oxygen_ratio,
+    has_advanced_support,
+    on_ecmo,
     brain,
     respiratory,
     cardiovascular,
     liver,
     kidney,
     hemostasis,
-    -- SOFA-2标准：过去24小时窗口内的最差评分
-    brain_24hours,
-    respiratory_24hours,
-    cardiovascular_24hours,
-    liver_24hours,
-    kidney_24hours,
-    hemostasis_24hours,
-    -- 辅助信息
-    ratio_type,
-    oxygen_ratio,
-    has_advanced_support,
-    on_ecmo,
-    -- SOFA-2总分（基于24小时窗口）
-    sofa2_24hours
-FROM score_final
+    (COALESCE(brain, 0) + COALESCE(respiratory, 0) + COALESCE(cardiovascular, 0) +
+     COALESCE(liver, 0) + COALESCE(kidney, 0) + COALESCE(hemostasis, 0)) AS sofa2_total
+FROM scorecomp
 WHERE hr >= 0
 ORDER BY stay_id, hr;
