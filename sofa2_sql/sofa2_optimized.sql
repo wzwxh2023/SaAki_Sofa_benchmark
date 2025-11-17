@@ -160,11 +160,10 @@ WITH co AS (
     SELECT
         ce.stay_id,
         ce.charttime,
-        ce.valuenum AS fio2_value
+        ce.valuenum AS fio2_value  -- FiO2百分比 (21-100%)
     FROM mimiciv_icu.chartevents ce
-    WHERE ce.itemid IN (229841, 229280, 230086)  -- FiO2相关itemid
-      AND ce.valuenum > 0
-      AND ce.valuenum <= 1
+    WHERE ce.itemid = 223835  -- 正确的FiO2 itemid
+      AND ce.valuenum BETWEEN 21 AND 100  -- FiO2百分比范围
 ),
 
 -- 步骤3: 预计算所有SF比值 (SpO2:FiO2)
@@ -172,7 +171,7 @@ WITH co AS (
     SELECT
         spo2.stay_id,
         spo2.charttime,
-        (spo2.spo2_value / fio2.fio2_value) AS oxygen_ratio,
+        (spo2.spo2_value / (fio2.fio2_value / 100.0)) AS oxygen_ratio,  -- 关键修复：百分比转小数
         adv.advanced_support AS has_advanced_support
     FROM spo2_raw spo2
     INNER JOIN fio2_raw fio2
@@ -215,7 +214,38 @@ WITH co AS (
 ),
 
 -- =================================================================
--- 呼吸系统小时级聚合 (核心逻辑：PF优先，SF备用)
+-- 步骤5: 小时级PF数据聚合 (仅包含PF比值)
+, pf_hourly AS (
+    SELECT
+        co.stay_id,
+        co.hr,
+        MIN(pf.oxygen_ratio) AS pf_ratio_min,
+        MAX(pf.has_advanced_support) AS pf_has_support
+    FROM co
+    LEFT JOIN pf_ratios_all pf
+        ON co.stay_id = pf.stay_id
+        AND pf.charttime >= co.starttime
+        AND pf.charttime < co.endtime
+    GROUP BY co.stay_id, co.hr
+),
+
+-- 步骤6: 小时级SF数据聚合 (仅包含SF比值)
+, sf_hourly AS (
+    SELECT
+        co.stay_id,
+        co.hr,
+        MIN(sf.oxygen_ratio) AS sf_ratio_min,
+        MAX(sf.has_advanced_support) AS sf_has_support
+    FROM co
+    LEFT JOIN sf_ratios_all sf
+        ON co.stay_id = sf.stay_id
+        AND sf.charttime >= co.starttime
+        AND sf.charttime < co.endtime
+    GROUP BY co.stay_id, co.hr
+),
+
+-- =================================================================
+-- 呼吸系统小时级聚合 (在JOIN层面严格执行PF优先原则)
 -- =================================================================
 , respiratory_hourly AS (
     SELECT
@@ -225,48 +255,37 @@ WITH co AS (
         -- ECMO状态：小时内是否有ECMO
         COALESCE(MAX(ecmo.ecmo_indicator), 0) AS on_ecmo,
 
-        -- 氧合指数选择逻辑：严格PF优先原则
+        -- 氧合指数类型：严格PF优先
         CASE
-            -- 步骤1: 检查小时内是否有有效PF比值
-            WHEN MIN(pf.oxygen_ratio) IS NOT NULL THEN 'PF'
-            -- 步骤2: 只有完全无PF时，才考虑SF
-            WHEN MIN(sf.oxygen_ratio) IS NOT NULL THEN 'SF'
+            WHEN pf.pf_ratio_min IS NOT NULL THEN 'PF'
+            WHEN sf.sf_ratio_min IS NOT NULL THEN 'SF'
             ELSE NULL
         END AS ratio_type,
 
-        -- 氧合指数值：根据选择的类型取最差值
-        CASE
-            WHEN MIN(pf.oxygen_ratio) IS NOT NULL
-            THEN MIN(pf.oxygen_ratio)  -- PF优先：取最小PF比值
-            WHEN MIN(sf.oxygen_ratio) IS NOT NULL
-            THEN MIN(sf.oxygen_ratio)  -- SF备用：取最小SF比值
-            ELSE NULL
-        END AS oxygen_ratio,
+        -- 氧合指数值：严格对应的PF或SF值
+        COALESCE(pf.pf_ratio_min, sf.sf_ratio_min) AS oxygen_ratio,
 
-        -- 呼吸支持状态：小时内最差状态
-        COALESCE(
-            MAX(pf.has_advanced_support),  -- PF数据中的支持状态
-            MAX(sf.has_advanced_support),  -- SF数据中的支持状态
-            0  -- 默认无支持
-        ) AS has_advanced_support
+        -- 呼吸支持状态：必须与氧合指数类型匹配！
+        CASE
+            WHEN pf.pf_ratio_min IS NOT NULL THEN pf.pf_has_support  -- PF对应的支持状态
+            WHEN sf.sf_ratio_min IS NOT NULL THEN sf.sf_has_support  -- SF对应的支持状态
+            ELSE 0
+        END AS has_advanced_support
 
     FROM co
-    -- 时间窗口连接：PF比值
-    LEFT JOIN pf_ratios_all pf
-        ON co.stay_id = pf.stay_id
-        AND pf.charttime >= co.starttime
-        AND pf.charttime < co.endtime
-    -- 时间窗口连接：SF比值
-    LEFT JOIN sf_ratios_all sf
+    -- 先连接小时级PF数据
+    LEFT JOIN pf_hourly pf
+        ON co.stay_id = pf.stay_id AND co.hr = pf.hr
+    -- 只有当该小时没有PF数据时，才考虑SF数据
+    LEFT JOIN sf_hourly sf
         ON co.stay_id = sf.stay_id
-        AND sf.charttime >= co.starttime
-        AND sf.charttime < co.endtime
+        AND co.hr = sf.hr
+        AND pf.pf_ratio_min IS NULL  -- 关键：仅当无PF时才连接SF
     -- 时间窗口连接：ECMO事件
     LEFT JOIN ecmo_events ecmo
         ON co.stay_id = ecmo.stay_id
         AND ecmo.charttime >= co.starttime
         AND ecmo.charttime < co.endtime
-    GROUP BY co.stay_id, co.hr
 ),
 
 -- =================================================================
