@@ -120,112 +120,183 @@ WITH co AS (
 ),
 
 -- =================================================================
--- RESPIRATORY/呼吸系统 (SOFA2标准：PF/SF比值 + 高级呼吸支持)
+-- 呼吸系统预计算CTEs (性能优化：预计算-连接-聚合模式)
 -- =================================================================
-, respiratory AS (
+
+-- 步骤1: 预计算所有PF比值 (血气分析)
+, pf_ratios_all AS (
+    SELECT
+        ie.stay_id,
+        bg.charttime,
+        bg.pao2fio2ratio AS oxygen_ratio,
+        CASE
+            WHEN vd.stay_id IS NOT NULL THEN 1
+            ELSE 0
+        END AS has_advanced_support
+    FROM mimiciv_derived.bg bg
+    INNER JOIN mimiciv_icu.icustays ie ON ie.subject_id = bg.subject_id
+    LEFT JOIN mimiciv_derived.ventilation vd
+        ON ie.stay_id = vd.stay_id
+        AND bg.charttime >= vd.starttime
+        AND bg.charttime <= vd.endtime
+    WHERE bg.specimen = 'ART.'
+      AND bg.pao2fio2ratio IS NOT NULL
+      AND bg.pao2fio2ratio > 0
+),
+
+-- 步骤2: 预计算SpO2和FiO2的原始数据
+, spo2_raw AS (
+    SELECT
+        ce.stay_id,
+        ce.charttime,
+        ce.valuenum AS spo2_value
+    FROM mimiciv_icu.chartevents ce
+    WHERE ce.itemid = 220277  -- SpO2
+      AND ce.valuenum > 0
+      AND ce.valuenum < 98  -- SF ratio只在SpO2<98%时有效
+),
+
+, fio2_raw AS (
+    SELECT
+        ce.stay_id,
+        ce.charttime,
+        ce.valuenum AS fio2_value
+    FROM mimiciv_icu.chartevents ce
+    WHERE ce.itemid IN (229841, 229280, 230086)  -- FiO2相关itemid
+      AND ce.valuenum > 0
+      AND ce.valuenum <= 1
+),
+
+-- 步骤3: 预计算所有SF比值 (SpO2:FiO2)
+, sf_ratios_all AS (
+    SELECT
+        spo2.stay_id,
+        spo2.charttime,
+        (spo2.spo2_value / fio2.fio2_value) AS oxygen_ratio,
+        adv.advanced_support AS has_advanced_support
+    FROM spo2_raw spo2
+    INNER JOIN fio2_raw fio2
+        ON spo2.stay_id = fio2.stay_id
+        AND spo2.charttime >= fio2.charttime
+        AND spo2.charttime < fio2.charttime + INTERVAL '1 hour'
+    LEFT JOIN LATERAL (
+        SELECT
+            CASE WHEN EXISTS(
+                SELECT 1 FROM mimiciv_derived.ventilation vd
+                WHERE vd.stay_id = spo2.stay_id
+                  AND vd.starttime < spo2.charttime + INTERVAL '1 hour'
+                  AND COALESCE(vd.endtime, spo2.charttime + INTERVAL '1 hour') > spo2.charttime
+                  AND vd.ventilation_status IN ('InvasiveVent', 'NonInvasiveVent', 'HFNC')
+            ) THEN 1 ELSE 0 END AS advanced_support
+    ) adv ON TRUE
+    WHERE spo2.spo2_value IS NOT NULL
+      AND fio2.fio2_value IS NOT NULL
+),
+
+-- 步骤4: 预计算所有ECMO记录
+, ecmo_events AS (
+    -- 方法1: 机械支持表中的ECMO
+    SELECT
+        ce.stay_id,
+        ce.charttime,
+        1 AS ecmo_indicator
+    FROM mimiciv_icu.chartevents ce
+    WHERE ce.itemid = 224660  -- 机械支持表ECMO
+
+    UNION ALL
+
+    -- 方法2: ECMO操作程序
+    SELECT
+        pe.stay_id,
+        pe.starttime AS charttime,
+        1 AS ecmo_indicator
+    FROM mimiciv_icu.procedureevents pe
+    WHERE pe.itemid IN (229529, 229530)  -- ECMO相关操作
+),
+
+-- =================================================================
+-- 呼吸系统小时级聚合 (核心逻辑：PF优先，SF备用)
+-- =================================================================
+, respiratory_hourly AS (
     SELECT
         co.stay_id,
         co.hr,
+
+        -- ECMO状态：小时内是否有ECMO
+        COALESCE(MAX(ecmo.ecmo_indicator), 0) AS on_ecmo,
+
+        -- 氧合指数选择逻辑：严格PF优先原则
+        CASE
+            -- 步骤1: 检查小时内是否有有效PF比值
+            WHEN MIN(pf.oxygen_ratio) IS NOT NULL THEN 'PF'
+            -- 步骤2: 只有完全无PF时，才考虑SF
+            WHEN MIN(sf.oxygen_ratio) IS NOT NULL THEN 'SF'
+            ELSE NULL
+        END AS ratio_type,
+
+        -- 氧合指数值：根据选择的类型取最差值
+        CASE
+            WHEN MIN(pf.oxygen_ratio) IS NOT NULL
+            THEN MIN(pf.oxygen_ratio)  -- PF优先：取最小PF比值
+            WHEN MIN(sf.oxygen_ratio) IS NOT NULL
+            THEN MIN(sf.oxygen_ratio)  -- SF备用：取最小SF比值
+            ELSE NULL
+        END AS oxygen_ratio,
+
+        -- 呼吸支持状态：小时内最差状态
+        COALESCE(
+            MAX(pf.has_advanced_support),  -- PF数据中的支持状态
+            MAX(sf.has_advanced_support),  -- SF数据中的支持状态
+            0  -- 默认无支持
+        ) AS has_advanced_support
+
+    FROM co
+    -- 时间窗口连接：PF比值
+    LEFT JOIN pf_ratios_all pf
+        ON co.stay_id = pf.stay_id
+        AND pf.charttime >= co.starttime
+        AND pf.charttime < co.endtime
+    -- 时间窗口连接：SF比值
+    LEFT JOIN sf_ratios_all sf
+        ON co.stay_id = sf.stay_id
+        AND sf.charttime >= co.starttime
+        AND sf.charttime < co.endtime
+    -- 时间窗口连接：ECMO事件
+    LEFT JOIN ecmo_events ecmo
+        ON co.stay_id = ecmo.stay_id
+        AND ecmo.charttime >= co.starttime
+        AND ecmo.charttime < co.endtime
+    GROUP BY co.stay_id, co.hr
+),
+
+-- =================================================================
+-- RESPIRATORY/呼吸系统 (SOFA2标准：最终评分计算)
+-- =================================================================
+, respiratory AS (
+    SELECT
+        stay_id,
+        hr,
         CASE
             -- 4分: ECMO
-            WHEN ecmo.on_ecmo = 1 THEN 4
+            WHEN on_ecmo = 1 THEN 4
             -- 4分: 最严重低氧血症 + 呼吸支持
-            WHEN resp.oxygen_ratio <=
-                CASE WHEN resp.ratio_type = 'SF' THEN 120 ELSE 75 END
-                AND resp.has_advanced_support = 1 THEN 4
+            WHEN oxygen_ratio <=
+                CASE WHEN ratio_type = 'SF' THEN 120 ELSE 75 END
+                AND has_advanced_support = 1 THEN 4
             -- 3分: 重度低氧血症 + 呼吸支持
-            WHEN resp.oxygen_ratio <=
-                CASE WHEN resp.ratio_type = 'SF' THEN 200 ELSE 150 END
-                AND resp.has_advanced_support = 1 THEN 3
+            WHEN oxygen_ratio <=
+                CASE WHEN ratio_type = 'SF' THEN 200 ELSE 150 END
+                AND has_advanced_support = 1 THEN 3
             -- 2分: 中度低氧血症
-            WHEN resp.oxygen_ratio <=
-                CASE WHEN resp.ratio_type = 'SF' THEN 250 ELSE 225 END THEN 2
+            WHEN oxygen_ratio <=
+                CASE WHEN ratio_type = 'SF' THEN 250 ELSE 225 END THEN 2
             -- 1分: 轻度低氧血症
-            WHEN resp.oxygen_ratio <= 300 THEN 1
-            -- 0分: 正常
-            WHEN resp.oxygen_ratio > 300 THEN 0
+            WHEN oxygen_ratio <= 300 THEN 1
+            -- 0分: 正常或缺失数据
+            WHEN oxygen_ratio > 300 OR oxygen_ratio IS NULL THEN 0
             ELSE 0
         END AS respiratory
-    FROM co
-    LEFT JOIN LATERAL (
-        -- 呼吸数据聚合
-        WITH resp_data AS (
-            -- 血气数据
-            SELECT
-                'PF' as ratio_type,
-                bg.pao2fio2ratio as oxygen_ratio,
-                CASE WHEN vd.stay_id IS NOT NULL THEN 1 ELSE 0 END as has_advanced_support
-            FROM mimiciv_derived.bg bg
-            INNER JOIN mimiciv_icu.icustays ie ON ie.subject_id = bg.subject_id
-            LEFT JOIN mimiciv_derived.ventilation vd
-                ON ie.stay_id = vd.stay_id
-                AND bg.charttime >= vd.starttime
-                AND bg.charttime <= vd.endtime
-            WHERE ie.stay_id = co.stay_id
-                AND bg.specimen = 'ART.'
-                AND bg.charttime >= co.starttime
-                AND bg.charttime < co.endtime
-            UNION ALL
-            -- SpO2数据 (替代指标)
-            SELECT
-                'SF' as ratio_type,
-                MIN(spo2.spo2) / MAX(fio2.fio2) as oxygen_ratio,
-                MAX(adv.has_advanced_support) as has_advanced_support
-            FROM mimiciv_icu.chartevents spo2
-            INNER JOIN mimiciv_icu.chartevents fio2
-                ON spo2.stay_id = fio2.stay_id
-                AND spo2.charttime >= fio2.charttime
-                AND spo2.charttime < fio2.charttime + INTERVAL '1 hour'
-            INNER JOIN mimiciv_icu.icustays ie ON spo2.stay_id = ie.stay_id
-            LEFT JOIN LATERAL (
-                SELECT 1 as has_advanced_support
-                FROM mimiciv_derived.ventilation vd
-                WHERE vd.stay_id = ie.stay_id
-                    AND vd.starttime < co.endtime
-                    AND COALESCE(vd.endtime, co.endtime) > co.starttime
-                    AND vd.ventilation_status IN ('InvasiveVent', 'NonInvasiveVent', 'HFNC')
-                LIMIT 1
-            ) adv ON TRUE
-            WHERE spo2.stay_id = co.stay_id
-                AND spo2.itemid = 220277  -- SpO2
-                AND spo2.valuenum > 0 AND spo2.valuenum < 98
-                AND spo2.charttime >= co.starttime
-                AND spo2.charttime < co.endtime
-                AND fio2.itemid IN (229841, 229280, 230086)
-            GROUP BY spo2.stay_id
-        )
-        SELECT
-            MIN(CASE WHEN has_advanced_support = 0 THEN oxygen_ratio END) as ratio_novent,
-            MIN(CASE WHEN has_advanced_support = 1 THEN oxygen_ratio END) as ratio_vent,
-            MIN(oxygen_ratio) as oxygen_ratio,
-            MAX(has_advanced_support) as has_advanced_support,
-            CASE
-                WHEN MIN(CASE WHEN has_advanced_support = 0 THEN oxygen_ratio END) IS NOT NULL THEN 'PF'
-                WHEN MIN(oxygen_ratio) IS NOT NULL AND MIN(spo2_val) < 98 THEN 'SF'
-                ELSE NULL
-            END as ratio_type
-        FROM resp_data
-        CROSS JOIN LATERAL (SELECT MIN(spo2_val) as spo2_val FROM resp_data) s
-    ) resp ON TRUE
-    LEFT JOIN LATERAL (
-        -- ECMO检测 (优化版本)
-        SELECT MAX(CASE
-            WHEN ce.itemid = 224660 THEN 1  -- 机械支持表ECMO
-            WHEN pe.itemid IN (229529, 229530) THEN 1  -- ECMO操作
-            ELSE 0
-        END) as on_ecmo
-        FROM co
-        LEFT JOIN mimiciv_icu.chartevents ce
-            ON co.stay_id = ce.stay_id
-            AND ce.charttime >= co.starttime
-            AND ce.charttime < co.endtime
-            AND ce.itemid = 224660
-        LEFT JOIN mimiciv_icu.procedureevents pe
-            ON co.stay_id = pe.stay_id
-            AND pe.starttime < co.endtime
-            AND COALESCE(pe.endtime, pe.starttime) > co.starttime
-            AND pe.itemid IN (229529, 229530)
-    ) ecmo ON TRUE
+    FROM respiratory_hourly
 ),
 
 -- =================================================================
