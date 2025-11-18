@@ -17,12 +17,14 @@ WITH co AS (
 -- 预处理步骤 (Staging CTEs)
 -- =================================================================
 
+-- =================================================================
 -- 步骤1: 预处理药物列表（统一维护，避免重复）
+-- =================================================================
 drug_params AS (
     SELECT UNNEST(ARRAY[
         '%propofol%', '%midazolam%', '%lorazepam%', '%diazepam%',
-        '%fentanyl%', '%remifentanil%', '%morphine%', '%hydromorphone%',
         '%dexmedetomidine%', '%ketamine%', '%clonidine%', '%etomidate%'
+        -- 移除镇痛药：fentanyl, remifentanil, morphine, hydromorphone
     ]) AS sedation_pattern
 ),
 delirium_params AS (
@@ -33,39 +35,83 @@ delirium_params AS (
     ]) AS delirium_pattern
 ),
 
--- 步骤2: 预处理所有GCS测量值，包括数据清洗和镇静状态标记
-gcs_stg AS (
+-- 步骤2: 预计算镇静药物输注时段（智能时间边界处理）
+sedation_infusion_periods AS (
     SELECT
-        gcs.stay_id,
-        gcs.charttime,
-        -- GCS数据清洗：处理异常值
+        ie.stay_id,
+        pr.starttime,
+        -- 智能时间边界处理：基于实际数据统计和临床合理性
         CASE
-            WHEN gcs.gcs < 3 THEN 3
-            WHEN gcs.gcs > 15 THEN 15
-            ELSE gcs.gcs
-        END AS gcs,
-        -- 判断在GCS测量时刻，是否有镇静药物在输注
-        MAX(
-            CASE
-                WHEN pr.starttime <= gcs.charttime
-                     AND COALESCE(pr.stoptime, gcs.charttime + INTERVAL '1 minute') > gcs.charttime
-                     AND EXISTS (
-                        SELECT 1
-                        FROM drug_params dp
-                        WHERE LOWER(pr.drug) LIKE dp.sedation_pattern
-                     )
-                THEN 1 ELSE 0
-            END
-        ) AS is_sedated
-    FROM mimiciv_derived.gcs gcs
-    -- 提前与icustays和prescriptions连接，避免LATERAL中重复连接
-    INNER JOIN mimiciv_icu.icustays ie ON gcs.stay_id = ie.stay_id
+            -- 情况1: 有明确停止时间且合理，使用实际时间
+            WHEN pr.stoptime IS NOT NULL
+                 AND pr.stoptime > pr.starttime
+                 AND EXTRACT(EPOCH FROM (pr.stoptime - pr.starttime)) BETWEEN 3600 AND 604800  -- 1小时-7天
+            THEN pr.stoptime
+
+            -- 情况2: 有停止时间但过短(<1小时)，可能是推注误分类，延长到合理时间
+            WHEN pr.stoptime IS NOT NULL
+                 AND pr.stoptime > pr.starttime
+                 AND EXTRACT(EPOCH FROM (pr.stoptime - pr.starttime)) < 3600
+            THEN pr.starttime + INTERVAL '4 hours'
+
+            -- 情况3: 有停止时间但过长(>7天)，可能是数据错误，截断到合理范围
+            WHEN pr.stoptime IS NOT NULL
+                 AND pr.stoptime > pr.starttime
+                 AND EXTRACT(EPOCH FROM (pr.stoptime - pr.starttime)) > 604800
+            THEN pr.starttime + INTERVAL '7 days'
+
+            -- 情况4: 无停止时间，基于ICU出院时间和药物类型设置合理上限
+            WHEN pr.stoptime IS NULL THEN
+                LEAST(
+                    ie.outtime,  -- 不超过ICU出院时间
+                    CASE
+                        -- 不同药物设置不同的默认持续时间
+                        WHEN pr.drug ILIKE '%propofol%' THEN pr.starttime + INTERVAL '24 hours'
+                        WHEN pr.drug ILIKE '%midazolam%' THEN pr.starttime + INTERVAL '48 hours'
+                        WHEN pr.drug ILIKE '%dexmedetomidine%' THEN pr.starttime + INTERVAL '12 hours'
+                        WHEN pr.drug ILIKE '%lorazepam%' THEN pr.starttime + INTERVAL '24 hours'
+                        WHEN pr.drug ILIKE '%diazepam%' THEN pr.starttime + INTERVAL '24 hours'
+                        ELSE pr.starttime + INTERVAL '24 hours'  -- 默认24小时
+                    END
+                )
+
+            ELSE pr.stoptime  -- 其他情况使用原始值
+        END AS stoptime,
+        -- 药物类型标识：精确匹配镇静药物（排除镇痛药）
+        CASE WHEN EXISTS (
+            SELECT 1 FROM drug_params dp
+            WHERE LOWER(pr.drug) LIKE dp.sedation_pattern
+        ) THEN 1 ELSE 0 END AS is_sedation_drug
+    FROM mimiciv_icu.icustays ie
     LEFT JOIN mimiciv_hosp.prescriptions pr ON ie.hadm_id = pr.hadm_id
-    WHERE gcs.gcs IS NOT NULL
-    GROUP BY gcs.stay_id, gcs.charttime, gcs.gcs
+    WHERE pr.starttime IS NOT NULL
+      -- 只考虑持续输注途径（更精确的镇静给药方式）
+      AND pr.route IN ('IV DRIP', 'IV', 'Intravenous', 'IVPCA', 'SC', 'IM')
 ),
 
--- 步骤3: 预处理每小时的谵妄药物使用情况
+-- 步骤3: 预计算每小时的镇静状态（性能优化：批量计算）
+sedation_hourly AS (
+    SELECT
+        co.stay_id,
+        co.hr,
+        co.starttime,
+        co.endtime,
+        -- 使用聚合函数避免复杂的LATERAL JOIN
+        MAX(CASE
+            WHEN sp.starttime <= co.endtime
+                 AND sp.stoptime > co.starttime
+                 AND sp.is_sedation_drug = 1
+            THEN 1 ELSE 0
+        END) AS has_sedation_infusion
+    FROM co
+    LEFT JOIN sedation_infusion_periods sp
+        ON co.stay_id = sp.stay_id
+        AND sp.starttime <= co.endtime
+        AND sp.stoptime > co.starttime
+    GROUP BY co.stay_id, co.hr, co.starttime, co.endtime
+),
+
+-- 步骤4: 预处理每小时的谵妄药物使用情况（保持原有逻辑）
 delirium_hourly AS (
     SELECT
         co.stay_id,
@@ -88,6 +134,29 @@ delirium_hourly AS (
     GROUP BY co.stay_id, co.hr
 ),
 
+-- 步骤5: 优化的GCS数据处理（简化版本）
+gcs_optimized AS (
+    SELECT
+        gcs.stay_id,
+        gcs.charttime,
+        -- GCS数据清洗：处理异常值
+        CASE
+            WHEN gcs.gcs < 3 THEN 3
+            WHEN gcs.gcs > 15 THEN 15
+            ELSE gcs.gcs
+        END AS gcs,
+        -- 高效判断GCS测量时刻的镇静状态：直接JOIN小时级镇静状态
+        CASE WHEN sh.has_sedation_infusion = 1 THEN 1 ELSE 0 END AS is_sedated
+    FROM mimiciv_derived.gcs gcs
+    INNER JOIN mimiciv_icu.icustays ie ON gcs.stay_id = ie.stay_id
+    -- 直接JOIN预计算的镇静状态，避免复杂的LATERAL JOIN
+    LEFT JOIN sedation_hourly sh
+        ON gcs.stay_id = sh.stay_id
+        AND gcs.charttime >= sh.starttime
+        AND gcs.charttime < sh.endtime
+    WHERE gcs.gcs IS NOT NULL
+),
+
 -- =================================================================
 -- BRAIN/神经系统 (整合版本：性能优化 + 逻辑清晰)
 -- =================================================================
@@ -96,7 +165,7 @@ gcs AS (
         co.stay_id,
         co.hr,
         gcs_vals.gcs,
-        -- GREATEST函数：清晰表达"取最大值"语义 + 处理缺失值
+        -- 使用窗口函数优化：清晰表达"取最大值"语义 + 处理缺失值
         GREATEST(
             -- 分数来源1: GCS评分（缺失值默认为0分）
             CASE
@@ -111,10 +180,10 @@ gcs AS (
             CASE WHEN d.on_delirium_med = 1 THEN 1 ELSE 0 END
         ) AS brain
     FROM co
-    -- 高效LATERAL：从预处理的GCS表中查找
+    -- 优化的LATERAL JOIN：从预处理的GCS表中查找
     LEFT JOIN LATERAL (
         SELECT gcs.gcs, gcs.is_sedated
-        FROM gcs_stg gcs
+        FROM gcs_optimized gcs
         WHERE gcs.stay_id = co.stay_id
           -- GCS测量时间必须在当前小时结束之前
           AND gcs.charttime <= co.endtime
@@ -147,8 +216,12 @@ pf_ratios_all AS (
         END AS has_advanced_support
     FROM mimiciv_derived.bg bg
     INNER JOIN mimiciv_icu.icustays ie ON ie.subject_id = bg.subject_id
+    -- 关键修复：约束血气时间在ICU住院时段内，避免跨住院污染
+    AND bg.charttime >= ie.intime
+    AND bg.charttime <= ie.outtime
     LEFT JOIN mimiciv_derived.ventilation vd
         ON ie.stay_id = vd.stay_id
+        -- 调整边界：血气记录与呼吸支持同一时刻亦视为已开启
         AND bg.charttime >= vd.starttime
         AND bg.charttime <= vd.endtime
         AND vd.ventilation_status IN ('InvasiveVent', 'NonInvasiveVent', 'HFNC', 'Tracheostomy')
@@ -176,28 +249,45 @@ fio2_raw AS (
         ce.valuenum AS fio2_value  -- FiO2百分比 (21-100%)
     FROM mimiciv_icu.chartevents ce
     WHERE ce.itemid = 223835  -- 正确的FiO2 itemid
-      AND ce.valuenum BETWEEN 21 AND 100  -- FiO2百分比范围
+          AND ce.valuenum BETWEEN 21 AND 100  -- FiO2百分比范围
 ),
 
--- 步骤3: 预计算所有SF比值 (SpO2:FiO2) - 简化版本
+-- 步骤3: 预计算所有SF比值 (SpO2:FiO2) - 修复时间匹配问题
 sf_ratios_all AS (
     SELECT
         spo2.stay_id,
         spo2.charttime,
-        (spo2.spo2_value / (fio2.fio2_value / 100.0)) AS oxygen_ratio,  -- 关键修复：百分比转小数
-        -- 简化的呼吸支持检测：直接JOIN ventilation表
-        CASE WHEN vd.stay_id IS NOT NULL THEN 1 ELSE 0 END AS has_advanced_support
-    FROM spo2_raw spo2
-    INNER JOIN fio2_raw fio2
-        ON spo2.stay_id = fio2.stay_id
-        AND fio2.charttime BETWEEN spo2.charttime - INTERVAL '1 hour' AND spo2.charttime  -- 统一向前看1小时
-    -- 直接LEFT JOIN ventilation表，简化复杂的LATERAL JOIN
-    LEFT JOIN mimiciv_derived.ventilation vd
-        ON spo2.stay_id = vd.stay_id
-        AND spo2.charttime BETWEEN vd.starttime AND vd.endtime  -- 标准的时间点-区间匹配
-        AND vd.ventilation_status IN ('InvasiveVent', 'NonInvasiveVent', 'HFNC', 'Tracheostomy')
-    WHERE spo2.spo2_value IS NOT NULL
-      AND fio2.fio2_value IS NOT NULL
+        spo2.oxygen_ratio,
+        spo2.has_advanced_support
+    FROM (
+        SELECT
+            spo2.stay_id,
+            spo2.charttime,
+              -- 关键修复：使用LATERAL子查询获取最近时间的FiO2
+            (spo2.spo2_value / (fio2_recent.fio2_value / 100.0)) AS oxygen_ratio,
+            -- 呼吸支持检测：直接JOIN ventilation表
+            CASE WHEN vd.stay_id IS NOT NULL THEN 1 ELSE 0 END AS has_advanced_support
+        FROM spo2_raw spo2
+        LEFT JOIN LATERAL (
+            -- 修复：选择SpO2记录时间前后1小时内绝对时间差最近的FiO2记录
+            SELECT fio2.fio2_value
+            FROM fio2_raw fio2
+            WHERE fio2.stay_id = spo2.stay_id
+              AND fio2.charttime BETWEEN spo2.charttime - INTERVAL '1 hour'
+                                   AND spo2.charttime + INTERVAL '1 hour'  -- 前后各1小时
+            ORDER BY ABS(EXTRACT(EPOCH FROM (fio2.charttime - spo2.charttime))) ASC  -- 按绝对时间差升序，最近的在前
+            LIMIT 1  -- 只取时间差最小的一条
+        ) fio2_recent ON TRUE
+        -- 直接LEFT JOIN ventilation表，简化复杂的LATERAL JOIN
+        LEFT JOIN mimiciv_derived.ventilation vd
+            ON spo2.stay_id = vd.stay_id
+            -- 同步PF逻辑：观测时间与支持开始同刻视为已支持
+            AND spo2.charttime >= vd.starttime
+            AND spo2.charttime <= vd.endtime
+          AND vd.ventilation_status IN ('InvasiveVent', 'NonInvasiveVent', 'HFNC', 'Tracheostomy')
+        WHERE spo2.spo2_value IS NOT NULL
+    ) spo2
+    WHERE spo2.oxygen_ratio IS NOT NULL  -- 确保FiO2匹配成功
 ),
 
 -- 步骤4: 预计算所有ECMO记录（与循环系统保持一致）
@@ -227,34 +317,50 @@ ecmo_events AS (
 ),
 
 -- =================================================================
--- 步骤5: 小时级PF数据聚合 (仅包含PF比值)
+-- 步骤5: 小时级PF数据聚合 (绑定最小值与其呼吸支持状态)
 pf_hourly AS (
     SELECT
         co.stay_id,
         co.hr,
-        MIN(pf.oxygen_ratio) AS pf_ratio_min,
-        MAX(pf.has_advanced_support) AS pf_has_support
+        pf_min.oxygen_ratio AS pf_ratio_min,
+        pf_min.has_advanced_support AS pf_has_support
     FROM co
-    LEFT JOIN pf_ratios_all pf
-        ON co.stay_id = pf.stay_id
-        AND pf.charttime >= co.starttime
-        AND pf.charttime < co.endtime
-    GROUP BY co.stay_id, co.hr
+    LEFT JOIN LATERAL (
+        -- 修复：选择该小时内氧合比值最小的记录，同时携带其呼吸支持状态
+        SELECT
+            pf.oxygen_ratio,
+            pf.has_advanced_support
+        FROM pf_ratios_all pf
+        WHERE pf.stay_id = co.stay_id
+          AND pf.charttime >= co.starttime
+          AND pf.charttime < co.endtime
+          AND pf.oxygen_ratio IS NOT NULL
+        ORDER BY pf.oxygen_ratio ASC  -- 按氧合比值升序，最小的在前
+        LIMIT 1  -- 只取最小值的那条记录，确保状态绑定
+    ) pf_min ON TRUE
 ),
 
--- 步骤6: 小时级SF数据聚合 (仅包含SF比值)
+-- 步骤6: 小时级SF数据聚合 (绑定最小值与其呼吸支持状态)
 sf_hourly AS (
     SELECT
         co.stay_id,
         co.hr,
-        MIN(sf.oxygen_ratio) AS sf_ratio_min,
-        MAX(sf.has_advanced_support) AS sf_has_support
+        sf_min.oxygen_ratio AS sf_ratio_min,
+        sf_min.has_advanced_support AS sf_has_support
     FROM co
-    LEFT JOIN sf_ratios_all sf
-        ON co.stay_id = sf.stay_id
-        AND sf.charttime >= co.starttime
-        AND sf.charttime < co.endtime
-    GROUP BY co.stay_id, co.hr
+    LEFT JOIN LATERAL (
+        -- 修复：选择该小时内SF比值最小的记录，同时携带其呼吸支持状态
+        SELECT
+            sf.oxygen_ratio,
+            sf.has_advanced_support
+        FROM sf_ratios_all sf
+        WHERE sf.stay_id = co.stay_id
+          AND sf.charttime >= co.starttime
+          AND sf.charttime < co.endtime
+          AND sf.oxygen_ratio IS NOT NULL
+        ORDER BY sf.oxygen_ratio ASC  -- 按SF比值升序，最小的在前
+        LIMIT 1  -- 只取最小值的那条记录，确保状态绑定
+    ) sf_min ON TRUE
 ),
 
 -- =================================================================
@@ -449,23 +555,23 @@ cardiovascular AS (
         co.hr,
         CASE
             -- 4分条件 (按优先级排序)
-            -- 4a: 机械循环支持 (任一设备)
-            WHEN COALESCE(mech.has_ecmo, 0) + COALESCE(mech.has_iabp, 0) +
-                 COALESCE(mech.has_impella, 0) + COALESCE(mech.has_lvad, 0) +
-                 COALESCE(mech.has_tandemheart, 0) + COALESCE(mech.has_rvad, 0) +
-                 COALESCE(mech.has_cardiac_assist, 0) > 0 THEN 4
+            -- 4a: 任意机械循环支持（含ECMO/IABP/LVAD等）直接评4分
+            WHEN COALESCE(mech.has_ecmo, 0) > 0
+                 OR other_mech_support_flag = 1 THEN 4
             -- 4b: NE+Epi总碱基剂量 > 0.4 mcg/kg/min
             WHEN ne_epi_total_base_dose > 0.4 THEN 4
-            -- 4c: NE+Epi > 0.2 且使用其他药物
-            WHEN ne_epi_total_base_dose > 0.2 AND other_vasopressor_flag = 1 THEN 4
+            -- 4c: 中剂量NE+Epi与任意其他血管活性药/正性肌力药联合
+            WHEN ne_epi_total_base_dose > 0.2
+                 AND other_vasopressor_flag = 1 THEN 4
             -- 4d: 多巴胺单独使用 > 40 μg/kg/min
             WHEN dopamine_only_score >= 4 THEN 4
 
             -- 3分条件 (按优先级排序)
             -- 3a: NE+Epi总碱基剂量 > 0.2 mcg/kg/min
             WHEN ne_epi_total_base_dose > 0.2 THEN 3
-            -- 3b: NE+Epi > 0 且使用其他药物
-            WHEN ne_epi_total_base_dose > 0 AND other_vasopressor_flag = 1 THEN 3
+            -- 3b: NE+Epi > 0 且合并其他血管活性药物或非ECMO机械支持
+            WHEN ne_epi_total_base_dose > 0
+                 AND other_vasopressor_flag = 1 THEN 3
             -- 3c: 多巴胺单独使用 > 20-40 μg/kg/min
             WHEN dopamine_only_score = 3 THEN 3
 
@@ -541,7 +647,12 @@ cardiovascular AS (
                          OR COALESCE(vaso.rate_phenylephrine, 0) > 0
                          OR COALESCE(vaso.rate_milrinone, 0) > 0))
                  THEN 1 ELSE 0
-            END AS other_vasopressor_flag
+            END AS other_vasopressor_flag,
+            -- 4. 非ECMO机械支持标志
+            CASE WHEN COALESCE(mech.has_iabp, 0) + COALESCE(mech.has_impella, 0) +
+                      COALESCE(mech.has_lvad, 0) + COALESCE(mech.has_tandemheart, 0) +
+                      COALESCE(mech.has_rvad, 0) + COALESCE(mech.has_cardiac_assist, 0) > 0
+                 THEN 1 ELSE 0 END AS other_mech_support_flag
     ) dose_calc
 ),
 
@@ -553,7 +664,10 @@ bilirubin_data AS (
         enz.bilirubin_total
     FROM mimiciv_icu.icustays stay
     JOIN mimiciv_derived.enzyme enz ON stay.hadm_id = enz.hadm_id
+    -- 关键修复：约束胆红素时间在ICU住院时段内，避免跨住院污染
     WHERE enz.bilirubin_total IS NOT NULL
+      AND enz.charttime >= stay.intime
+      AND enz.charttime <= stay.outtime
 ),
 
 -- =================================================================
@@ -589,7 +703,10 @@ chemistry_data AS (
         chem.creatinine
     FROM mimiciv_icu.icustays stay
     JOIN mimiciv_derived.chemistry chem ON stay.hadm_id = chem.hadm_id
+    -- 关键修复：约束肌酐时间在ICU住院时段内，避免跨住院污染
     WHERE chem.creatinine IS NOT NULL
+      AND chem.charttime >= stay.intime
+      AND chem.charttime <= stay.outtime
 ),
 bg_data AS (
     SELECT
@@ -600,7 +717,10 @@ bg_data AS (
         bg.bicarbonate
     FROM mimiciv_icu.icustays stay
     JOIN mimiciv_derived.bg bg ON stay.subject_id = bg.subject_id
+    -- 关键修复：约束血气数据时间在ICU住院时段内，避免跨住院污染
     WHERE bg.specimen = 'ART.'
+      AND bg.charttime >= stay.intime
+      AND bg.charttime <= stay.outtime
 ),
 
 -- Step 1: 为每个stay_id查找最佳体重（多层次查找策略）
@@ -704,27 +824,43 @@ urine_output_sliding_windows AS (
         stay_id,
         hr,
         uo_ml_kg_hr,
-        -- 6小时滑动窗口：累计6小时尿量，计算平均尿量
-        SUM(uo_ml_kg_hr) OVER (
+        -- 6小时滑动窗口：必须存在完整6个小时的观测才计算平均
+        CASE
+            WHEN COUNT(uo_ml_kg_hr) OVER w6 = 6
+            THEN SUM(uo_ml_kg_hr) OVER w6 / 6.0
+            ELSE NULL
+        END AS uo_avg_6h,
+
+        -- 12小时滑动窗口：同理需要完整12小时数据
+        CASE
+            WHEN COUNT(uo_ml_kg_hr) OVER w12 = 12
+            THEN SUM(uo_ml_kg_hr) OVER w12 / 12.0
+            ELSE NULL
+        END AS uo_avg_12h,
+
+        -- 24小时滑动窗口：仅当24个连续小时均有尿量记录时才计算
+        CASE
+            WHEN COUNT(uo_ml_kg_hr) OVER w24 = 24
+            THEN SUM(uo_ml_kg_hr) OVER w24 / 24.0
+            ELSE NULL
+        END AS uo_avg_24h
+    FROM urine_output_hourly
+    WINDOW
+        w6 AS (
             PARTITION BY stay_id
             ORDER BY hr
             ROWS BETWEEN 5 PRECEDING AND 0 FOLLOWING
-        ) / 6.0 as uo_avg_6h,
-
-        -- 12小时滑动窗口：累计12小时尿量，计算平均尿量
-        SUM(uo_ml_kg_hr) OVER (
+        ),
+        w12 AS (
             PARTITION BY stay_id
             ORDER BY hr
             ROWS BETWEEN 11 PRECEDING AND 0 FOLLOWING
-        ) / 12.0 as uo_avg_12h,
-
-        -- 24小时滑动窗口：累计24小时尿量，计算平均尿量
-        SUM(uo_ml_kg_hr) OVER (
+        ),
+        w24 AS (
             PARTITION BY stay_id
             ORDER BY hr
             ROWS BETWEEN 23 PRECEDING AND 0 FOLLOWING
-        ) / 24.0 as uo_avg_24h
-    FROM urine_output_hourly
+        )
 ),
 
 -- Step 5: 使用 "Gaps and Islands" 算法计算连续低尿量时间（基于真实滑动窗口数据）
@@ -736,14 +872,18 @@ urine_output_islands AS (
         hr - ROW_NUMBER() OVER (PARTITION BY stay_id, is_low_05 ORDER BY hr) as island_low_05,
         hr - ROW_NUMBER() OVER (PARTITION BY stay_id, is_low_03 ORDER BY hr) as island_low_03,
         hr - ROW_NUMBER() OVER (PARTITION BY stay_id, is_anuric ORDER BY hr) as island_anuric,
-        is_low_05, is_low_03, is_anuric
+        is_low_05, is_low_03, is_anuric,
+        -- 保留滑动窗口数据用于后续处理
+        uo_avg_6h, uo_avg_12h, uo_avg_24h
     FROM (
         SELECT
             stay_id, hr,
-            -- 各条件标志（基于6小时滑动窗口平均尿量，符合SOFA2标准）
-            CASE WHEN uo_avg_6h < 0.5 THEN 1 ELSE 0 END as is_low_05,
-            CASE WHEN uo_avg_6h < 0.3 THEN 1 ELSE 0 END as is_low_03,
-            CASE WHEN uo_ml_kg_hr = 0 THEN 1 ELSE 0 END as is_anuric
+            -- 各条件标志（基于每小时实际尿量，符合临床连续性要求）
+            CASE WHEN uo_ml_kg_hr < 0.5 THEN 1 ELSE 0 END as is_low_05,
+            CASE WHEN uo_ml_kg_hr < 0.3 THEN 1 ELSE 0 END as is_low_03,
+            CASE WHEN uo_ml_kg_hr = 0 THEN 1 ELSE 0 END as is_anuric,
+            -- 保留滑动窗口数据
+            uo_avg_6h, uo_avg_12h, uo_avg_24h
         FROM urine_output_sliding_windows
     ) flagged
 ),
@@ -829,7 +969,10 @@ kidney AS (
         GREATEST(
             CASE WHEN rrt_active_flag = 1 THEN 4 ELSE 0 END,
             CASE
-                WHEN (creatinine_max > 1.2 OR consecutive_low_03h_max >= 6)
+                WHEN (
+                    creatinine_max > 1.2
+                    OR (uo_avg_6h_max IS NOT NULL AND uo_avg_6h_max < 0.3)
+                )
                      AND (COALESCE(potassium_max, 0) >= 6.0
                           OR (COALESCE(ph_min, 7.4) <= 7.2 AND COALESCE(bicarbonate_min, 24) <= 12))
                 THEN 4 ELSE 0 END,
@@ -838,15 +981,15 @@ kidney AS (
                 WHEN creatinine_max > 2.0 THEN 2
                 WHEN creatinine_max > 1.2 THEN 1
                 ELSE 0 END,
-            -- 尿量评分（SOFA2标准：基于滑动窗口连续时间）
+            -- 尿量评分（SOFA2标准：使用滑动时间窗平均尿量）
             CASE
-                -- 3分：<0.3 mL/kg/h ≥24小时 或 无尿≥12小时
-                WHEN consecutive_low_03h_max >= 24 THEN 3
+                -- 3分：<0.3 mL/kg/h 连续24小时的平均值 或 无尿≥12小时
+                WHEN uo_avg_24h_max IS NOT NULL AND uo_avg_24h_max < 0.3 THEN 3
                 WHEN consecutive_anuric_h_max >= 12 THEN 3
-                -- 2分：<0.5 mL/kg/h ≥12小时
-                WHEN consecutive_low_05h_max >= 12 THEN 2
-                -- 1分：<0.5 mL/kg/h 持续6-12小时
-                WHEN consecutive_low_05h_max >= 6 THEN 1
+                -- 2分：<0.5 mL/kg/h 的12小时平均值
+                WHEN uo_avg_12h_max IS NOT NULL AND uo_avg_12h_max < 0.5 THEN 2
+                -- 1分：<0.5 mL/kg/h 的6小时平均值
+                WHEN uo_avg_6h_max IS NOT NULL AND uo_avg_6h_max < 0.5 THEN 1
                 ELSE 0 END
         ) AS kidney
     FROM kidney_hourly_aggregates
@@ -860,7 +1003,10 @@ platelet_data AS (
         cbc.platelet
     FROM mimiciv_icu.icustays stay
     JOIN mimiciv_derived.complete_blood_count cbc ON stay.hadm_id = cbc.hadm_id
+    -- 关键修复：约束血小板时间在ICU住院时段内，避免跨住院污染
     WHERE cbc.platelet IS NOT NULL
+      AND cbc.charttime >= stay.intime
+      AND cbc.charttime <= stay.outtime
 ),
 
 -- =================================================================
@@ -918,7 +1064,7 @@ score_final AS (
 )
 
 -- =================================================================
--- 最终输出
+-- 最终输出（原查询方式保持兼容）
 -- =================================================================
 SELECT
     stay_id,
@@ -938,3 +1084,61 @@ SELECT
 FROM score_final
 WHERE hr >= 0
 ORDER BY stay_id, hr;
+
+-- =================================================================
+-- 创建表并插入数据（分离方式）
+-- =================================================================
+DROP TABLE IF EXISTS mimiciv_derived.sofa2_scores CASCADE;
+
+CREATE TABLE mimiciv_derived.sofa2_scores AS
+SELECT
+    stay_id,
+    hadm_id,
+    subject_id,
+    hr,
+    starttime,
+    endtime,
+    -- SOFA2标准：24小时窗口最差评分
+    brain_24hours AS brain,
+    respiratory_24hours AS respiratory,
+    cardiovascular_24hours AS cardiovascular,
+    liver_24hours AS liver,
+    kidney_24hours AS kidney,
+    hemostasis_24hours AS hemostasis,
+    sofa2_24hours AS sofa2_total
+FROM score_final
+WHERE hr >= 0;
+
+-- 添加主键和索引以提高查询性能
+ALTER TABLE mimiciv_derived.sofa2_scores
+ADD COLUMN sofa2_score_id SERIAL PRIMARY KEY;
+
+CREATE INDEX idx_sofa2_stay_id ON mimiciv_derived.sofa2_scores(stay_id);
+CREATE INDEX idx_sofa2_subject_id ON mimiciv_derived.sofa2_scores(subject_id);
+CREATE INDEX idx_sofa2_hadm_id ON mimiciv_derived.sofa2_scores(hadm_id);
+CREATE INDEX idx_sofa2_total_score ON mimiciv_derived.sofa2_scores(sofa2_total);
+
+-- 添加表注释
+COMMENT ON TABLE mimiciv_derived.sofa2_scores IS 'SOFA2评分系统结果表，包含每小时评分和24小时窗口最差评分';
+COMMENT ON COLUMN mimiciv_derived.sofa2_scores.stay_id IS 'ICU住院ID';
+COMMENT ON COLUMN mimiciv_derived.sofa2_scores.hadm_id IS '住院ID';
+COMMENT ON COLUMN mimiciv_derived.sofa2_scores.subject_id IS '患者ID';
+COMMENT ON COLUMN mimiciv_derived.sofa2_scores.hr IS 'ICU住院小时数';
+COMMENT ON COLUMN mimiciv_derived.sofa2_scores.brain IS '神经系统评分(0-4)';
+COMMENT ON COLUMN mimiciv_derived.sofa2_scores.respiratory IS '呼吸系统评分(0-4)';
+COMMENT ON COLUMN mimiciv_derived.sofa2_scores.cardiovascular IS '心血管系统评分(0-4)';
+COMMENT ON COLUMN mimiciv_derived.sofa2_scores.liver IS '肝脏系统评分(0-4)';
+COMMENT ON COLUMN mimiciv_derived.sofa2_scores.kidney IS '肾脏系统评分(0-4)';
+COMMENT ON COLUMN mimiciv_derived.sofa2_scores.hemostasis IS '凝血系统评分(0-4)';
+COMMENT ON COLUMN mimiciv_derived.sofa2_scores.sofa2_total IS 'SOFA2总分(0-24)';
+
+-- 显示创建结果统计
+SELECT
+    'SOFA2评分表创建完成' AS status,
+    COUNT(*) AS total_records,
+    COUNT(DISTINCT stay_id) AS unique_stays,
+    COUNT(DISTINCT subject_id) AS unique_patients,
+    MIN(sofa2_total) AS min_score,
+    MAX(sofa2_total) AS max_score,
+    ROUND(AVG(sofa2_total), 2) AS avg_score
+FROM mimiciv_derived.sofa2_scores;
