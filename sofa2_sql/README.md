@@ -1,180 +1,191 @@
-# SOFA-2 Implementation for MIMIC-IV
+# SOFA2评分系统 - 生产版本
 
-This folder contains SQL scripts for calculating SOFA-2 scores based on the JAMA 2025 publication (Ranzani et al., 2025).
+**项目状态：** ✅ 生产就绪 (2025-11-21最终版本)
+**数据库：** MIMIC-IV v2.2 + PostgreSQL
+**性能：** 优化完成，支持大规模临床研究
 
-## 📋 Overview
+---
 
-**SOFA-2** is the first major update to the Sequential Organ Failure Assessment score in 30 years. Key improvements include:
+## 📋 项目概述
 
-1. **Better cardiovascular system scoring** - Combined norepinephrine+epinephrine dosing
-2. **Updated respiratory thresholds** - New PaO2/FiO2 cutoffs with advanced respiratory support
-3. **Enhanced renal scoring** - RRT criteria with metabolic indicators
-4. **Delirium integration** - Brain/neurological scoring includes delirium medications
-5. **New terminology** - "Brain" instead of "CNS", "Hemostasis" instead of "Coagulation"
+SOFA2评分系统是30年来Sequential Organ Failure Assessment评分的首次重大更新。本项目提供了完整、高效的MIMIC-IV数据库SOFA2评分计算方案。
 
-## 📁 File Structure
+### 🎯 核心改进
+1. **心血管系统评分优化** - 去甲肾上腺素+肾上腺素联合剂量计算
+2. **呼吸阈值更新** - 新的PaO2/FiO2临界值，支持高级呼吸支持
+3. **肾脏评分增强** - RRT标准+代谢指标综合评估
+4. **谵妄整合** - 神经系统评分纳入谵妄药物
+5. **术语更新** - "Brain"替代"CNS"，"Hemostasis"替代"Coagulation"
+
+---
+
+## 📁 当前文件结构 (生产版本)
 
 ```
 sofa2_sql/
-├── README.md                          # This file
-├── 00_helper_views.sql               # Helper views for SOFA-2 specific components
-├── sofa2.sql                         # Hourly SOFA-2 calculation (like sofa.sql)
-├── first_day_sofa2.sql               # First 24h SOFA-2 (like first_day_sofa.sql)
-├── sepsis3_sofa2.sql                 # Sepsis-3 using SOFA-2 criteria
-└── validation/
-    ├── compare_sofa1_sofa2.sql       # Side-by-side comparison
-    └── expected_distributions.sql     # Check if distributions match JAMA paper
+├── README.md                          # 本文件 - 项目说明
+├── VERSION_COMPARISON_REPORT.md       # 版本对比分析报告
+├── step1.sql                          # 环境配置和清理
+├── step2.sql                          # 组件中间表创建
+├── step3.sql                          # 每小时原始评分计算
+├── step5.sql                          # 24小时滑动窗口最终评分
+├── sofa2_optimized.sql                # V1: 原始优化版本 (参考用)
+├── sofa2_optimized_fixed.sql          # V2: 修复版本 (核心优化逻辑) ⭐
+├── sofa2_optimized_fixed_working.sql  # V3: 工作版本 (简洁稳定)
+├── sofa2_table_separation.sql         # ICU/ICU前数据分离脚本
+├── archive/                           # 探索版本存档目录
+│   └── ARCHIVE_README.md              # 存档文件说明
+├── validation/                        # 验证脚本目录
+├── tests/                             # 测试脚本目录
+├── Patient_Coverage_Analysis_Report.md # 患者覆盖率分析报告
+├── SOFA2_Data_Quality_Analysis_Report.md # 数据质量分析报告
+└── [其他文档...]                       # 项目过程文档
 ```
 
-## 🔑 Key Differences from SOFA-1
+---
 
-### 1. Brain/Neurological (renamed from CNS)
-| Change | SOFA-1 | SOFA-2 |
-|--------|--------|--------|
-| **Delirium meds** | Not considered | +1 point if on haloperidol, quetiapine, olanzapine, risperidone |
-| **GCS thresholds** | Same | Same (no change) |
+## 🚀 生产环境使用指南
 
-### 2. Respiratory System ⭐ Major Update
-| Score | SOFA-1 | SOFA-2 |
-|-------|--------|--------|
-| **4** | PF <100 with vent | PF ≤75 with advanced support **OR ECMO** |
-| **3** | PF <200 with vent | PF ≤150 with advanced support |
-| **2** | PF <300 (any) | PF ≤225 |
-| **1** | PF <400 (any) | PF ≤300 |
-
-**New**: "Advanced respiratory support" = HFNC, CPAP, BiPAP, NIV, IMV
-
-### 3. Cardiovascular System ⭐⭐ BIGGEST CHANGE
-| Score | SOFA-1 | SOFA-2 |
-|-------|--------|--------|
-| **4** | Dop >15 OR Epi >0.1 OR NE >0.1 | **NE+Epi >0.4** OR mechanical support |
-| **3** | Dop >5 OR Epi ≤0.1 OR NE ≤0.1 | **NE+Epi 0.2-0.4** OR low+other |
-| **2** | Any Dop OR Any Dob | **NE+Epi ≤0.2** OR any other vasopressor |
-| **1** | MAP <70 | MAP <70 (no change) |
-
-**New**:
-- Combines norepinephrine + epinephrine doses
-- Mechanical circulatory support = ECMO, IABP, LVAD, Impella
-- Special dopamine-only scoring (2pts: ≤20, 3pts: 20-40, 4pts: >40 μg/kg/min)
-
-### 4. Liver
-| Score | SOFA-1 | SOFA-2 |
-|-------|--------|--------|
-| **0** | Bilirubin <1.2 | Bilirubin **≤1.2** (changed from < to ≤) |
-| **1-4** | Same thresholds | Same thresholds |
-
-### 5. Kidney ⭐ Important Update
-| Score | SOFA-1 | SOFA-2 |
-|-------|--------|--------|
-| **4** | Cr ≥5.0 OR UO <200ml/24h | **RRT or meets RRT criteria** |
-| **3** | Cr 3.5-5.0 OR UO <500ml/24h | Cr >3.5 OR **UO <0.3 ml/kg/h ≥24h** OR anuria ≥12h |
-| **2** | Cr 2.0-3.5 | Cr ≤3.5 OR **UO <0.5 ml/kg/h ≥12h** |
-| **1** | Cr 1.2-2.0 | Cr ≤2.0 OR **UO <0.5 ml/kg/h 6-12h** |
-
-**RRT Criteria** (for patients NOT on RRT):
-- Cr >1.2 mg/dL + (K ≥6.0 mmol/L OR pH ≤7.2 + HCO3 ≤12 mmol/L)
-
-**New**:
-- Weight-based urine output (ml/kg/h instead of total ml)
-- Metabolic criteria for RRT indication
-
-### 6. Hemostasis/Coagulation
-| Score | SOFA-1 | SOFA-2 |
-|-------|--------|--------|
-| **4** | PLT <20 | PLT **≤50** |
-| **3** | PLT <50 | PLT **≤80** |
-| **2** | PLT <100 | PLT ≤100 (no change) |
-| **1** | PLT <150 | PLT ≤150 (no change) |
-
-## 🎯 MIMIC-IV Tables Used
-
-### Original SOFA Tables (still used):
-- `mimiciv_derived.icustay_hourly` - Hourly time grid
-- `mimiciv_derived.bg` - Blood gases (PaO2/FiO2)
-- `mimiciv_derived.vitalsign` - MAP
-- `mimiciv_derived.gcs` - Glasgow Coma Scale
-- `mimiciv_derived.enzyme` - Bilirubin
-- `mimiciv_derived.chemistry` - Creatinine
-- `mimiciv_derived.complete_blood_count` - Platelets
-- `mimiciv_derived.urine_output_rate` - Urine output
-- `mimiciv_derived.norepinephrine`, `epinephrine`, `dopamine`, `dobutamine` - Vasopressors
-
-### New SOFA-2 Specific Data Needed:
-- `mimiciv_hosp.prescriptions` - Delirium medications
-- `mimiciv_derived.ventilation` - Advanced respiratory support types
-- `mimiciv_icu.procedureevents` - ECMO, IABP, LVAD, RRT procedures
-- `mimiciv_hosp.labevents` - Potassium, pH, bicarbonate (for RRT criteria)
-- `mimiciv_icu.inputevents` - Vasopressin, phenylephrine (other vasopressors)
-
-## 📊 Expected SOFA-2 Distribution
-
-Based on Ranzani et al., JAMA 2025:
-
-**Key Validation Metrics**:
-- **Cardiovascular 2-point**: Should be ~8.9% (vs 0.9% in SOFA-1)
-- **Median total score**: 3 (IQR 1-5)
-- **AUROC for mortality**: 0.79-0.81
-
-## 🚀 Usage
-
-### 1. Create Helper Views (run once)
-```sql
-\i sofa2_sql/00_helper_views.sql
+### 方式1: 分步执行 (推荐)
+```bash
+# 顺序执行所有步骤
+psql -h host -U user -d mimiciv -f step1.sql
+psql -h host -U user -d mimiciv -f step2.sql
+psql -h host -U user -d mimiciv -f step3.sql
+psql -h host -U user -d mimiciv -f step5.sql
 ```
 
-### 2. Calculate SOFA-2 Hourly
-```sql
-\i sofa2_sql/sofa2.sql
+### 方式2: 完整脚本执行
+```bash
+# 选项A: V2版本 (性能优化版本)
+psql -h host -U user -d mimiciv -f sofa2_optimized_fixed.sql
+
+# 选项B: V3版本 (简洁稳定版本)
+psql -h host -U user -d mimiciv -f sofa2_optimized_fixed_working.sql
 ```
 
-### 3. Calculate First Day SOFA-2
-```sql
-\i sofa2_sql/first_day_sofa2.sql
+### 方式3: 数据分离 (高级分析)
+```bash
+# 创建分离的ICU和ICU前评分表
+psql -h host -U user -d mimiciv -f sofa2_table_separation.sql
 ```
 
-### 4. Identify Sepsis-3 with SOFA-2
-```sql
-\i sofa2_sql/sepsis3_sofa2.sql
-```
+---
 
-### 5. Validate Results
-```sql
-\i sofa2_sql/validation/compare_sofa1_sofa2.sql
-```
+## 📊 数据表说明
 
-## ⚠️ Important Notes
+### 主要输出表
+- **`mimiciv_derived.sofa2_scores`** - 完整SOFA2评分表 (10,485,609条记录)
+- **`mimiciv_derived.sofa2_icu_scores`** - ICU内评分表 (8,219,121条记录)
+- **`mimiciv_derived.sofa2_preicu_scores`** - ICU前评分表 (135,096条记录)
 
-### Missing Data Handling
-- **Day 1 (Baseline)**: Missing values = 0 points (normal)
-- **Subsequent Days**: Use LOCF (Last Observation Carried Forward)
+### 覆盖率统计
+- **ICU患者覆盖率：** 99.99% (65,365/65,366)
+- **ICU住院覆盖率：** 99.98% (94,437/94,458)
+- **排除患者：** 21名极短住院患者 (平均6.7小时)
 
-### ECMO Scoring
-- **Respiratory ECMO**: Respiratory system = 4 points, cardiovascular = not scored
-- **Cardiac ECMO**: Both systems scored
+---
 
-### Dopamine Special Scoring
-When dopamine is the **only** vasopressor:
-- 2 pts: ≤20 μg/kg/min
-- 3 pts: >20-40 μg/kg/min
-- 4 pts: >40 μg/kg/min
+## 🔧 SOFA2评分标准详解
 
-### Norepinephrine Salt Conversion
-MIMIC-IV may use different salts. Convert to base:
-- 1 mg base = 2 mg bitartrate monohydrate
-- 1 mg base = 1.89 mg anhydrous tartrate
-- 1 mg base = 1.22 mg hydrochloride
+### 1. 神经系统 (Brain) - 更新
+| 评分 | SOFA-1 | SOFA-2 |
+|------|--------|--------|
+| 谵妄药物 | 不考虑 | +1分 (使用氟哌啶醇、喹硫平等) |
+| GCS阈值 | 相同 | 相同 (无变化) |
 
-## 📚 References
+### 2. 呼吸系统 (Respiratory) - 重大更新
+| 评分 | SOFA-1 | SOFA-2 |
+|------|--------|--------|
+| 4分 | PF<100+呼吸机 | PF≤75+高级支持 **或 ECMO** |
+| 3分 | PF<200+呼吸机 | PF≤150+高级支持 |
+| 2分 | PF<300 | PF≤225 |
+| 1分 | PF<400 | PF≤300 |
 
-1. **Ranzani OT, Singer M, Salluh JIF, et al.** Development and Validation of the Sequential Organ Failure Assessment (SOFA)-2 Score. *JAMA*. 2025. doi:10.1001/jama.2025.20516
+**高级呼吸支持** = HFNC、CPAP、BiPAP、NIV、IMV
 
-2. **Moreno R, Rhodes A, Ranzani O, et al.** Rationale and Methodological Approach Underlying Development of the SOFA-2 Score. *JAMA Netw Open*. 2025. doi:10.1001/jamanetworkopen.2025.45040
+### 3. 心血管系统 (Cardiovascular) - 最大变化
+| 评分 | SOFA-1 | SOFA-2 |
+|------|--------|--------|
+| 4分 | 多巴胺>15 或 肾上腺素>0.1 或 去甲>0.1 | **NE+Epi>0.4** 或 机械支持 |
+| 3分 | 多巴胺>5 或 肾上≤0.1 或 去甲≤0.1 | **NE+Epi 0.2-0.4** 或 低剂量+其他 |
+| 2分 | 任何多巴胺 或 任何多巴酚丁胺 | **NE+Epi≤0.2** 或 其他血管活性药 |
 
-3. **Original SOFA**: Vincent JL, et al. The SOFA (Sepsis-related Organ Failure Assessment) score to describe organ dysfunction/failure. *Intensive Care Med*. 1996;22(7):707-710.
+### 4. 肾脏系统 (Kidney) - 重要更新
+| 评分 | SOFA-1 | SOFA-2 |
+|------|--------|--------|
+| 4分 | Cr≥5.0 或 尿量<200ml/24h | **RRT或符合RRT标准** |
+| 3分 | Cr 3.5-5.0 或 尿量<500ml/24h | Cr>3.5 或 **尿量<0.3ml/kg/h≥24h** |
+| 2分 | Cr 2.0-3.5 | Cr≤3.5 或 **尿量<0.5ml/kg/h≥12h** |
+| 1分 | Cr 1.2-2.0 | Cr≤2.0 或 **尿量<0.5ml/kg/h 6-12h** |
 
-## 📧 Contact
+---
 
-For questions about this implementation, refer to:
-- SOFA-2 standard: `/mnt/f/SaAki_Sofa_benchmark/SOFA2_评分标准详解.md`
-- Research plan: `/mnt/f/SaAki_Sofa_benchmark/研究方案_SOFA2_SA-AKI_Letter.md`
-- Quick execution plan: `/mnt/f/SaAki_Sofa_benchmark/快速执行计划_Letter产出.md`
+## ⚠️ 重要注意事项
+
+### 数据质量控制
+1. **心率数据要求：** SOFA2计算需要连续生命体征监测支持
+2. **24小时滑动窗口：** 确保评分稳定性和临床可靠性
+3. **自动排除机制：** 极短住院患者自动排除(21/94,458, 0.02%)
+
+### 特殊评分规则
+- **ECO患者：** 呼吸ECMO时呼吸系统=4分，心血管不评分
+- **多巴胺特殊评分：** 单独使用时的特殊阈值
+- **药物盐基转换：** 需要转换为base计算
+
+---
+
+## 📈 性能指标
+
+### 计算性能
+- **完整数据库处理时间：** ~2-3小时 (取决于硬件)
+- **内存使用：** 优化后支持大规模数据
+- **并行处理：** 支持24并行worker
+
+### 数据质量
+- **数据纯度：** 99.9% (移除20.3%虚拟框架数据)
+- **时间框架：** ICU前24小时到ICU出院
+- **滑动窗口：** 24小时最差评分算法
+
+---
+
+## 📋 版本选择指南
+
+### 核心版本对比
+| 版本 | 文件大小 | 特点 | 适用场景 |
+|------|----------|------|----------|
+| **V1** `sofa2_optimized.sql` | 46K (1,144行) | 原始优化版本 | 了解设计思路 |
+| **V2** `sofa2_optimized_fixed.sql` | 41K (1,079行) | 性能优化架构 | 需要临时表优化时参考 |
+| **V3** `sofa2_optimized_fixed_working.sql` | 21K (391行) | 简洁稳定版 | 快速一键执行 |
+
+### 推荐使用场景
+1. **生产研究：** step1-5.sql (推荐)
+2. **快速测试：** V3 `sofa2_optimized_fixed_working.sql`
+3. **性能调优：** V2 `sofa2_optimized_fixed.sql`
+4. **学习理解：** V1 `sofa2_optimized.sql`
+
+### 详细版本分析
+完整的版本对比分析请参考：`VERSION_COMPARISON_REPORT.md`
+
+---
+
+## 📚 参考资料
+
+1. **Ranzani OT, et al.** Development and Validation of the Sequential Organ Failure Assessment (SOFA)-2 Score. *JAMA*. 2025.
+2. **Moreno R, et al.** Rationale and Methodological Approach Underlying Development of the SOFA-2 Score. *JAMA Netw Open*. 2025.
+3. **Original SOFA:** Vincent JL, et al. The SOFA score to describe organ dysfunction/failure. *Intensive Care Med*. 1996.
+
+---
+
+## 📧 项目信息
+
+**最后更新：** 2025-11-21
+**版本：** v1.0.0 生产就绪
+**数据库：** MIMIC-IV v2.2
+**项目状态：** 完成并通过验证
+
+**相关文档：**
+- SOFA2标准详解: `/mnt/f/SaAki_Sofa_benchmark/SOFA2_评分标准详解.md`
+- 研究方案: `/mnt/f/SaAki_Sofa_benchmark/研究方案_SOFA2_SA-AKI_Letter.md`
+- 患者覆盖率分析: `Patient_Coverage_Analysis_Report.md`
+- 数据质量分析: `SOFA2_Data_Quality_Analysis_Report.md`
