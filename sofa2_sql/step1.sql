@@ -21,3 +21,10 @@ DROP TABLE IF EXISTS mimiciv_derived.sofa2_stage1_rrt CASCADE;
 DROP TABLE IF EXISTS mimiciv_derived.sofa2_stage1_urine CASCADE;
 DROP TABLE IF EXISTS mimiciv_derived.sofa2_stage1_platelets CASCADE;
 DROP TABLE IF EXISTS mimiciv_derived.sofa2_hourly_raw CASCADE;
+-- 缺少以下表的清理：
+DROP TABLE IF EXISTS mimiciv_derived.sofa2_stage1_delirium CASCADE;
+DROP TABLE IF EXISTS mimiciv_derived.sofa2_stage1_brain CASCADE;
+DROP TABLE IF EXISTS mimiciv_derived.sofa2_stage1_resp_support CASCADE;
+DROP TABLE IF EXISTS mimiciv_derived.sofa2_stage1_oxygen CASCADE;
+DROP TABLE IF EXISTS mimiciv_derived.sofa2_stage1_coag CASCADE;
+DROP TABLE IF EXISTS mimiciv_derived.sofa2_stage1_liver CASCADE;
