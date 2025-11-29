@@ -1,462 +1,352 @@
--- ------------------------------------------------------------------
--- Title: First Day SOFA-2 Score
--- Description: SOFA-2 score calculated on the FIRST DAY of ICU stay
+-- =================================================================
+-- Title: Sequential Organ Failure Assessment 2 (SOFA2) - First Day Score
+-- Description: 首日SOFA2评分计算脚本
+-- 基于SOFA2最新标准(JAMA 2025)，计算ICU患者首日的器官功能评分
 --
--- Based on JAMA 2025 publication:
--- Ranzani OT, Singer M, Salluh JIF, et al.
--- Development and Validation of the Sequential Organ Failure Assessment (SOFA)-2 Score.
--- JAMA. 2025. doi:10.1001/jama.2025.20516
+-- SOFA2主要改进：
+-- 1. 心血管系统评分优化 - 去甲肾上腺素+肾上腺素联合剂量计算
+-- 2. 呼吸阈值更新 - 新的PaO2/FiO2临界值，支持高级呼吸支持
+-- 3. 肾脏评分增强 - RRT标准+代谢指标综合评估
+-- 4. 谵妄整合 - 神经系统评分纳入谵妄药物
+-- 5. 术语更新 - "Brain"替代"CNS"，"Hemostasis"替代"Coagulation"
 --
--- Time window: First 24 hours after ICU admission (-6h to +24h to capture
--- values immediately before ICU admission)
+-- 数据源：
+-- - mimiciv_derived.sofa2_scores (SOFA2每小时评分表)
+-- - mimiciv_icu.icustays (ICU住院信息)
 --
--- Usage: This table is commonly used for:
--- 1. ICU admission severity assessment
--- 2. Risk stratification
--- 3. Sepsis-3 identification (when combined with infection)
--- ------------------------------------------------------------------
+-- 时间窗口：ICU入院前6小时至ICU入院后24小时 (首日评估窗口)
+-- =================================================================
+
+-- 设置性能参数
+SET work_mem = '512MB';
+SET maintenance_work_mem = '512MB';
+SET max_parallel_workers = 8;
+SET max_parallel_workers_per_gather = 4;
+SET enable_partitionwise_join = on;
+SET enable_partitionwise_aggregate = on;
+SET enable_parallel_hash = on;
+SET jit = off;
 
 -- =================================================================
--- HELPER: Get patient weight
+-- 删除已存在的表
 -- =================================================================
-WITH patient_weight AS (
+DROP TABLE IF EXISTS mimiciv_derived.first_day_sofa2 CASCADE;
+
+-- =================================================================
+-- 计算首日SOFA2评分
+-- =================================================================
+CREATE TABLE mimiciv_derived.first_day_sofa2 AS
+WITH
+-- 定义首日时间窗口：ICU入院前6小时至ICU入院后24小时
+sofa2_first_day_window AS (
+    SELECT
+        ie.stay_id,
+        ie.hadm_id,
+        ie.subject_id,
+        ie.intime,
+        ie.outtime,
+        ie.intime - INTERVAL '6 hours' AS window_start_time,  -- ICU入院前6小时
+        ie.intime + INTERVAL '24 hours' AS window_end_time,  -- ICU入院后24小时
+        s2.hr,
+        s2.starttime,
+        s2.endtime,
+        s2.brain,
+        s2.respiratory,
+        s2.cardiovascular,
+        s2.liver,
+        s2.kidney,
+        s2.hemostasis,
+        s2.sofa2_total
+    FROM mimiciv_icu.icustays ie
+    JOIN mimiciv_derived.sofa2_scores s2
+        ON ie.stay_id = s2.stay_id
+        AND s2.endtime >= ie.intime - INTERVAL '6 hours'
+        AND s2.starttime <= ie.intime + INTERVAL '24 hours'
+),
+
+-- 计算首日最差评分（基于24小时滑动窗口）
+first_day_worst_scores AS (
     SELECT
         stay_id,
-        weight
-    FROM mimiciv_derived.first_day_weight
-    WHERE weight IS NOT NULL AND weight > 0
-)
+        hadm_id,
+        subject_id,
+        intime,
+        outtime,
+        window_start_time,
+        window_end_time,
 
--- =================================================================
--- HELPER: Delirium medications (within first 24h)
--- =================================================================
-, delirium_meds_first_day AS (
-    SELECT DISTINCT
-        ie.stay_id,
-        1 AS on_delirium_med
-    FROM mimiciv_icu.icustays ie
-    INNER JOIN mimiciv_hosp.prescriptions pr
-        ON ie.hadm_id = pr.hadm_id
-    WHERE (LOWER(pr.drug) LIKE '%haloperidol%'
-           OR LOWER(pr.drug) LIKE '%quetiapine%'
-           OR LOWER(pr.drug) LIKE '%olanzapine%'
-           OR LOWER(pr.drug) LIKE '%risperidone%')
-          -- Check if active during first day
-          AND pr.starttime::date <= (ie.intime)::date + INTERVAL '1' DAY
-          AND COALESCE(pr.stoptime::date, (ie.intime)::date + INTERVAL '2' DAY)
-              >= (ie.intime)::date
-)
+        -- 计算各系统的首日最差评分
+        MAX(brain) AS brain_worst,
+        MAX(respiratory) AS respiratory_worst,
+        MAX(cardiovascular) AS cardiovascular_worst,
+        MAX(liver) AS liver_worst,
+        MAX(kidney) AS kidney_worst,
+        MAX(hemostasis) AS hemostasis_worst,
 
--- =================================================================
--- HELPER: Advanced respiratory support (first 24h)
--- =================================================================
-, advanced_resp_first_day AS (
+        -- 首日总评分 = 各系统最差评分之和
+        MAX(brain) + MAX(respiratory) + MAX(cardiovascular) +
+        MAX(liver) + MAX(kidney) + MAX(hemostasis) AS sofa2_first_day_total,
+
+        -- 统计信息
+        COUNT(*) AS hourly_measurements,
+        MIN(starttime) AS first_measurement_time,
+        MAX(endtime) AS last_measurement_time,
+
+        -- ICU入院时刻的评分（基线）
+        MAX(CASE WHEN hr = 0 THEN sofa2_total ELSE 0 END) AS sofa2_at_icu_admission
+    FROM sofa2_first_day_window
+    GROUP BY stay_id, hadm_id, subject_id, intime, outtime, window_start_time, window_end_time
+),
+
+-- 添加患者基本信息和住院信息
+patient_demographics AS (
     SELECT
-        ie.stay_id,
-        MAX(CASE
-            WHEN v.ventilation_status IN ('InvasiveVent', 'Tracheostomy',
-                                           'NonInvasiveVent', 'HFNC')
-            THEN 1
+        fdw.*,
+        pat.anchor_age AS age,  -- MIMIC-IV使用anchor_age而不是dob
+        pat.gender,
+        adm.race,
+        adm.admission_type,
+        adm.admission_location,
+        adm.hospital_expire_flag,
+        CASE
+            WHEN adm.deathtime IS NOT NULL THEN 1
             ELSE 0
-        END) AS has_advanced_support
-    FROM mimiciv_icu.icustays ie
-    LEFT JOIN mimiciv_derived.ventilation v
-        ON ie.stay_id = v.stay_id
-            AND v.starttime >= ie.intime - INTERVAL '6 HOUR'
-            AND v.starttime <= ie.intime + INTERVAL '1 DAY'
-    GROUP BY ie.stay_id
-)
+        END AS icu_mortality,
+        ROUND(EXTRACT(EPOCH FROM (fdw.outtime - fdw.intime))/3600.0, 1) AS icu_los_hours,
+        EXTRACT(EPOCH FROM (fdw.outtime - fdw.intime))/86400.0 AS icu_los_days
+    FROM first_day_worst_scores fdw
+    LEFT JOIN mimiciv_hosp.patients pat ON fdw.subject_id = pat.subject_id
+    LEFT JOIN mimiciv_hosp.admissions adm ON fdw.hadm_id = adm.hadm_id
+),
 
--- =================================================================
--- HELPER: Mechanical circulatory support (first 24h)
--- =================================================================
-, mechanical_support_first_day AS (
-    SELECT DISTINCT
-        ie.stay_id,
-        1 AS has_mechanical_support
-    FROM mimiciv_icu.icustays ie
-    INNER JOIN mimiciv_icu.chartevents ce
-        ON ie.stay_id = ce.stay_id
-    WHERE ce.itemid IN (228001, 229270, 229272, 228000, 224797, 224798)
-          AND ce.charttime >= ie.intime - INTERVAL '6 HOUR'
-          AND ce.charttime <= ie.intime + INTERVAL '1 DAY'
-)
-
--- =================================================================
--- HELPER: RRT status (first 24h)
--- =================================================================
-, rrt_first_day AS (
-    SELECT DISTINCT
-        ie.stay_id,
-        1 AS on_rrt
-    FROM mimiciv_icu.icustays ie
-    INNER JOIN mimiciv_derived.rrt r
-        ON ie.stay_id = r.stay_id
-    WHERE r.dialysis_active = 1
-          AND r.charttime >= ie.intime - INTERVAL '6 HOUR'
-          AND r.charttime <= ie.intime + INTERVAL '1 DAY'
-)
-
--- =================================================================
--- SECTION 1: BRAIN/NEUROLOGICAL
--- =================================================================
-, gcs_first_day AS (
+-- 添加临床状态信息
+clinical_status AS (
     SELECT
-        ie.stay_id,
-        MIN(gcs.gcs) AS gcs_min
-    FROM mimiciv_icu.icustays ie
-    LEFT JOIN mimiciv_derived.gcs gcs
-        ON ie.stay_id = gcs.stay_id
-            AND gcs.charttime >= ie.intime - INTERVAL '6 HOUR'
-            AND gcs.charttime <= ie.intime + INTERVAL '1 DAY'
-    GROUP BY ie.stay_id
-)
+        pd.*,
+        CASE
+            WHEN pd.sofa2_first_day_total >= 15 THEN 'Critical'
+            WHEN pd.sofa2_first_day_total >= 12 THEN 'Severe'
+            WHEN pd.sofa2_first_day_total >= 8 THEN 'Moderate'
+            WHEN pd.sofa2_first_day_total >= 4 THEN 'Mild'
+            ELSE 'Minimal'
+        END AS severity_category,
 
--- =================================================================
--- SECTION 2: RESPIRATORY
--- =================================================================
-, pafi_first_day AS (
-    SELECT ie.stay_id
-        , bg.charttime
-        , bg.pao2fio2ratio
-        -- Check if on advanced support
-        , CASE
-            WHEN v.stay_id IS NOT NULL THEN 1
+        CASE
+            WHEN pd.sofa2_first_day_total >= 2 THEN 1
             ELSE 0
-        END AS on_advanced_support
-        -- Check if on ECMO
-        , CASE
-            WHEN ms.has_mechanical_support = 1 THEN 1
-            ELSE 0
-        END AS on_ecmo
-    FROM mimiciv_icu.icustays ie
-    LEFT JOIN mimiciv_derived.bg bg
-        ON ie.subject_id = bg.subject_id
-            AND bg.charttime >= ie.intime - INTERVAL '6 HOUR'
-            AND bg.charttime <= ie.intime + INTERVAL '1 DAY'
-            AND bg.specimen = 'ART.'
-    LEFT JOIN mimiciv_derived.ventilation v
-        ON ie.stay_id = v.stay_id
-            AND bg.charttime >= v.starttime
-            AND bg.charttime <= v.endtime
-            AND v.ventilation_status IN ('InvasiveVent', 'Tracheostomy',
-                                          'NonInvasiveVent', 'HFNC')
-    LEFT JOIN mechanical_support_first_day ms
-        ON ie.stay_id = ms.stay_id
+        END AS organ_failure_flag,
+
+        -- 计算器官系统衰竭数量（评分>=2的系统）
+        (CASE WHEN pd.brain_worst >= 2 THEN 1 ELSE 0 END +
+         CASE WHEN pd.respiratory_worst >= 2 THEN 1 ELSE 0 END +
+         CASE WHEN pd.cardiovascular_worst >= 2 THEN 1 ELSE 0 END +
+         CASE WHEN pd.liver_worst >= 2 THEN 1 ELSE 0 END +
+         CASE WHEN pd.kidney_worst >= 2 THEN 1 ELSE 0 END +
+         CASE WHEN pd.hemostasis_worst >= 2 THEN 1 ELSE 0 END) AS failing_organs_count
+    FROM patient_demographics pd
 )
 
-, pf_first_day AS (
-    SELECT
-        stay_id,
-        MIN(CASE WHEN on_advanced_support = 0 THEN pao2fio2ratio END) AS pf_novent_min,
-        MIN(CASE WHEN on_advanced_support = 1 THEN pao2fio2ratio END) AS pf_vent_min,
-        MAX(on_advanced_support) AS has_advanced_support,
-        MAX(on_ecmo) AS on_ecmo
-    FROM pafi_first_day
-    GROUP BY stay_id
-)
-
--- =================================================================
--- SECTION 3: CARDIOVASCULAR
--- =================================================================
-, vitals_first_day AS (
-    SELECT
-        ie.stay_id,
-        MIN(v.mbp) AS mbp_min
-    FROM mimiciv_icu.icustays ie
-    LEFT JOIN mimiciv_derived.vitalsign v
-        ON ie.stay_id = v.stay_id
-            AND v.charttime >= ie.intime - INTERVAL '6 HOUR'
-            AND v.charttime <= ie.intime + INTERVAL '1 DAY'
-    GROUP BY ie.stay_id
-)
-
--- Extract vasopressors from derived tables (first 24h)
-, vaso_stg AS (
-    SELECT ie.stay_id, 'norepinephrine' AS treatment, vaso_rate AS rate
-    FROM mimiciv_icu.icustays ie
-    INNER JOIN mimiciv_derived.norepinephrine mv
-        ON ie.stay_id = mv.stay_id
-            AND mv.starttime >= ie.intime - INTERVAL '6 HOUR'
-            AND mv.starttime <= ie.intime + INTERVAL '1 DAY'
-    UNION ALL
-    SELECT ie.stay_id, 'epinephrine' AS treatment, vaso_rate AS rate
-    FROM mimiciv_icu.icustays ie
-    INNER JOIN mimiciv_derived.epinephrine mv
-        ON ie.stay_id = mv.stay_id
-            AND mv.starttime >= ie.intime - INTERVAL '6 HOUR'
-            AND mv.starttime <= ie.intime + INTERVAL '1 DAY'
-    UNION ALL
-    SELECT ie.stay_id, 'dobutamine' AS treatment, vaso_rate AS rate
-    FROM mimiciv_icu.icustays ie
-    INNER JOIN mimiciv_derived.dobutamine mv
-        ON ie.stay_id = mv.stay_id
-            AND mv.starttime >= ie.intime - INTERVAL '6 HOUR'
-            AND mv.starttime <= ie.intime + INTERVAL '1 DAY'
-    UNION ALL
-    SELECT ie.stay_id, 'dopamine' AS treatment, vaso_rate AS rate
-    FROM mimiciv_icu.icustays ie
-    INNER JOIN mimiciv_derived.dopamine mv
-        ON ie.stay_id = mv.stay_id
-            AND mv.starttime >= ie.intime - INTERVAL '6 HOUR'
-            AND mv.starttime <= ie.intime + INTERVAL '1 DAY'
-)
-
-, vaso_mv AS (
-    SELECT
-        ie.stay_id,
-        wt.weight,
-        -- Convert to mcg/kg/min
-        MAX(CASE WHEN v.treatment = 'norepinephrine' THEN v.rate / COALESCE(wt.weight, 80) END) AS rate_norepinephrine,
-        MAX(CASE WHEN v.treatment = 'epinephrine' THEN v.rate / COALESCE(wt.weight, 80) END) AS rate_epinephrine,
-        MAX(CASE WHEN v.treatment = 'dopamine' THEN v.rate / COALESCE(wt.weight, 80) END) AS rate_dopamine,
-        MAX(CASE WHEN v.treatment = 'dobutamine' THEN v.rate / COALESCE(wt.weight, 80) END) AS rate_dobutamine
-    FROM mimiciv_icu.icustays ie
-    LEFT JOIN patient_weight wt
-        ON ie.stay_id = wt.stay_id
-    LEFT JOIN vaso_stg v
-        ON ie.stay_id = v.stay_id
-    GROUP BY ie.stay_id, wt.weight
-)
-
--- =================================================================
--- SECTION 4: LIVER
--- =================================================================
-, liver_first_day AS (
-    SELECT
-        ie.stay_id,
-        MAX(enz.bilirubin_total) AS bilirubin_max
-    FROM mimiciv_icu.icustays ie
-    LEFT JOIN mimiciv_derived.enzyme enz
-        ON ie.hadm_id = enz.hadm_id
-            AND enz.charttime >= ie.intime - INTERVAL '6 HOUR'
-            AND enz.charttime <= ie.intime + INTERVAL '1 DAY'
-    GROUP BY ie.stay_id
-)
-
--- =================================================================
--- SECTION 5: KIDNEY
--- =================================================================
-, kidney_labs_first_day AS (
-    SELECT
-        ie.stay_id,
-        MAX(chem.creatinine) AS creatinine_max,
-        MAX(chem.potassium) AS potassium_max
-    FROM mimiciv_icu.icustays ie
-    LEFT JOIN mimiciv_derived.chemistry chem
-        ON ie.hadm_id = chem.hadm_id
-            AND chem.charttime >= ie.intime - INTERVAL '6 HOUR'
-            AND chem.charttime <= ie.intime + INTERVAL '1 DAY'
-    GROUP BY ie.stay_id
-)
-
-, kidney_bg_first_day AS (
-    SELECT
-        ie.stay_id,
-        MIN(bg.ph) AS ph_min,
-        MIN(bg.bicarbonate) AS bicarbonate_min
-    FROM mimiciv_icu.icustays ie
-    LEFT JOIN mimiciv_derived.bg bg
-        ON ie.subject_id = bg.subject_id
-            AND bg.specimen = 'ART.'
-            AND bg.charttime >= ie.intime - INTERVAL '6 HOUR'
-            AND bg.charttime <= ie.intime + INTERVAL '1 DAY'
-    GROUP BY ie.stay_id
-)
-
-, uo_first_day AS (
-    SELECT
-        ie.stay_id,
-        uo.urineoutput,
-        -- Convert to ml/kg/h
-        uo.urineoutput / COALESCE(wt.weight, 80) / 24 AS uo_ml_kg_h
-    FROM mimiciv_icu.icustays ie
-    LEFT JOIN mimiciv_derived.first_day_urine_output uo
-        ON ie.stay_id = uo.stay_id
-    LEFT JOIN patient_weight wt
-        ON ie.stay_id = wt.stay_id
-)
-
--- =================================================================
--- SECTION 6: HEMOSTASIS
--- =================================================================
-, hemostasis_first_day AS (
-    SELECT
-        ie.stay_id,
-        MIN(cbc.platelet) AS platelet_min
-    FROM mimiciv_icu.icustays ie
-    LEFT JOIN mimiciv_derived.complete_blood_count cbc
-        ON ie.hadm_id = cbc.hadm_id
-            AND cbc.charttime >= ie.intime - INTERVAL '6 HOUR'
-            AND cbc.charttime <= ie.intime + INTERVAL '1 DAY'
-    GROUP BY ie.stay_id
-)
-
--- =================================================================
--- COMBINE ALL COMPONENTS
--- =================================================================
-, scorecomp AS (
-    SELECT ie.stay_id, ie.subject_id, ie.hadm_id
-        -- Brain
-        , gcs.gcs_min
-        , dm.on_delirium_med
-        -- Respiratory
-        , pf.pf_novent_min
-        , pf.pf_vent_min
-        , pf.has_advanced_support
-        , pf.on_ecmo
-        -- Cardiovascular
-        , v.mbp_min
-        , vaso.rate_norepinephrine
-        , vaso.rate_epinephrine
-        , vaso.rate_dopamine
-        , vaso.rate_dobutamine
-        , ms.has_mechanical_support
-        -- Liver
-        , liver.bilirubin_max
-        -- Kidney
-        , kl.creatinine_max
-        , kl.potassium_max
-        , kb.ph_min
-        , kb.bicarbonate_min
-        , uo.uo_ml_kg_h
-        , rrt.on_rrt
-        -- Hemostasis
-        , hemo.platelet_min
-    FROM mimiciv_icu.icustays ie
-    LEFT JOIN gcs_first_day gcs
-        ON ie.stay_id = gcs.stay_id
-    LEFT JOIN delirium_meds_first_day dm
-        ON ie.stay_id = dm.stay_id
-    LEFT JOIN pf_first_day pf
-        ON ie.stay_id = pf.stay_id
-    LEFT JOIN vitals_first_day v
-        ON ie.stay_id = v.stay_id
-    LEFT JOIN vaso_mv vaso
-        ON ie.stay_id = vaso.stay_id
-    LEFT JOIN mechanical_support_first_day ms
-        ON ie.stay_id = ms.stay_id
-    LEFT JOIN liver_first_day liver
-        ON ie.stay_id = liver.stay_id
-    LEFT JOIN kidney_labs_first_day kl
-        ON ie.stay_id = kl.stay_id
-    LEFT JOIN kidney_bg_first_day kb
-        ON ie.stay_id = kb.stay_id
-    LEFT JOIN uo_first_day uo
-        ON ie.stay_id = uo.stay_id
-    LEFT JOIN rrt_first_day rrt
-        ON ie.stay_id = rrt.stay_id
-    LEFT JOIN hemostasis_first_day hemo
-        ON ie.stay_id = hemo.stay_id
-)
-
--- =================================================================
--- CALCULATE SOFA-2 SCORES
--- =================================================================
-, scorecalc AS (
-    SELECT stay_id, subject_id, hadm_id
-        -- BRAIN/NEUROLOGICAL
-        , CASE
-            WHEN gcs_min <= 5 THEN 4
-            WHEN gcs_min >= 6 AND gcs_min <= 8 THEN 3
-            WHEN gcs_min >= 9 AND gcs_min <= 12 THEN 2
-            WHEN (gcs_min >= 13 AND gcs_min <= 14) OR on_delirium_med = 1 THEN 1
-            WHEN gcs_min = 15 AND COALESCE(on_delirium_med, 0) = 0 THEN 0
-            WHEN gcs_min IS NULL AND COALESCE(on_delirium_med, 0) = 0 THEN NULL
-            ELSE 0
-        END AS brain
-
-        -- RESPIRATORY
-        , CASE
-            WHEN on_ecmo = 1 THEN 4
-            WHEN pf_vent_min <= 75 AND has_advanced_support = 1 THEN 4
-            WHEN pf_vent_min <= 150 AND has_advanced_support = 1 THEN 3
-            WHEN pf_novent_min <= 225 THEN 2
-            WHEN pf_vent_min <= 225 THEN 2
-            WHEN pf_novent_min <= 300 THEN 1
-            WHEN pf_vent_min <= 300 THEN 1
-            WHEN COALESCE(pf_vent_min, pf_novent_min) IS NULL THEN NULL
-            ELSE 0
-        END AS respiratory
-
-        -- CARDIOVASCULAR
-        , CASE
-            WHEN has_mechanical_support = 1 THEN 4
-            WHEN (COALESCE(rate_norepinephrine, 0) + COALESCE(rate_epinephrine, 0)) > 0.4 THEN 4
-            WHEN (COALESCE(rate_norepinephrine, 0) + COALESCE(rate_epinephrine, 0)) > 0.2
-                 AND (COALESCE(rate_norepinephrine, 0) + COALESCE(rate_epinephrine, 0)) <= 0.4
-                 AND (COALESCE(rate_dopamine, 0) > 0 OR COALESCE(rate_dobutamine, 0) > 0)
-                THEN 4
-            WHEN (COALESCE(rate_norepinephrine, 0) + COALESCE(rate_epinephrine, 0)) > 0.2
-                 AND (COALESCE(rate_norepinephrine, 0) + COALESCE(rate_epinephrine, 0)) <= 0.4
-                THEN 3
-            WHEN (COALESCE(rate_norepinephrine, 0) + COALESCE(rate_epinephrine, 0)) > 0
-                 AND (COALESCE(rate_norepinephrine, 0) + COALESCE(rate_epinephrine, 0)) <= 0.2
-                 AND (COALESCE(rate_dopamine, 0) > 0 OR COALESCE(rate_dobutamine, 0) > 0)
-                THEN 3
-            WHEN (COALESCE(rate_norepinephrine, 0) + COALESCE(rate_epinephrine, 0)) > 0
-                 AND (COALESCE(rate_norepinephrine, 0) + COALESCE(rate_epinephrine, 0)) <= 0.2
-                THEN 2
-            WHEN COALESCE(rate_dopamine, 0) > 0 OR COALESCE(rate_dobutamine, 0) > 0 THEN 2
-            WHEN mbp_min < 70 THEN 1
-            WHEN COALESCE(mbp_min, rate_norepinephrine, rate_epinephrine,
-                          rate_dopamine, rate_dobutamine) IS NULL THEN NULL
-            ELSE 0
-        END AS cardiovascular
-
-        -- LIVER
-        , CASE
-            WHEN bilirubin_max > 12.0 THEN 4
-            WHEN bilirubin_max > 6.0 AND bilirubin_max <= 12.0 THEN 3
-            WHEN bilirubin_max > 3.0 AND bilirubin_max <= 6.0 THEN 2
-            WHEN bilirubin_max > 1.2 AND bilirubin_max <= 3.0 THEN 1
-            WHEN bilirubin_max IS NULL THEN NULL
-            ELSE 0
-        END AS liver
-
-        -- KIDNEY
-        , CASE
-            WHEN on_rrt = 1 THEN 4
-            WHEN creatinine_max > 1.2
-                 AND (potassium_max >= 6.0 OR (ph_min <= 7.2 AND bicarbonate_min <= 12))
-                THEN 4
-            WHEN creatinine_max > 3.5 THEN 3
-            WHEN uo_ml_kg_h < 0.3 THEN 3
-            WHEN creatinine_max > 2.0 AND creatinine_max <= 3.5 THEN 2
-            WHEN uo_ml_kg_h >= 0.3 AND uo_ml_kg_h < 0.5 THEN 2
-            WHEN creatinine_max > 1.2 AND creatinine_max <= 2.0 THEN 1
-            WHEN COALESCE(creatinine_max, uo_ml_kg_h) IS NULL THEN NULL
-            ELSE 0
-        END AS kidney
-
-        -- HEMOSTASIS
-        , CASE
-            WHEN platelet_min <= 50 THEN 4
-            WHEN platelet_min <= 80 THEN 3
-            WHEN platelet_min <= 100 THEN 2
-            WHEN platelet_min <= 150 THEN 1
-            WHEN platelet_min IS NULL THEN NULL
-            ELSE 0
-        END AS hemostasis
-
-    FROM scorecomp
-)
-
+-- 最终输出
 SELECT
-    subject_id, hadm_id, stay_id
-    -- Total SOFA-2 score (impute 0 for missing)
-    , COALESCE(brain, 0)
-      + COALESCE(respiratory, 0)
-      + COALESCE(cardiovascular, 0)
-      + COALESCE(liver, 0)
-      + COALESCE(kidney, 0)
-      + COALESCE(hemostasis, 0)
-      AS sofa2_total
-    -- Individual components
-    , COALESCE(brain, 0) AS brain_24hours
-    , COALESCE(respiratory, 0) AS respiratory_24hours
-    , COALESCE(cardiovascular, 0) AS cardiovascular_24hours
-    , COALESCE(liver, 0) AS liver_24hours
-    , COALESCE(kidney, 0) AS kidney_24hours
-    , COALESCE(hemostasis, 0) AS hemostasis_24hours
-FROM scorecalc;
+    -- 基础信息
+    stay_id,
+    hadm_id,
+    subject_id,
+    intime AS icu_intime,
+    outtime AS icu_outtime,
+
+    -- 首日SOFA2评分
+    sofa2_first_day_total AS sofa2,
+    brain_worst AS brain,
+    respiratory_worst AS respiratory,
+    cardiovascular_worst AS cardiovascular,
+    liver_worst AS liver,
+    kidney_worst AS kidney,
+    hemostasis_worst AS hemostasis,
+
+    -- 基线评分
+    sofa2_at_icu_admission AS sofa2_icu_admission,
+
+    -- 时间窗口信息
+    window_start_time,
+    window_end_time,
+    first_measurement_time,
+    last_measurement_time,
+    hourly_measurements AS total_measurements,
+
+    -- 患者人口学信息
+    age,
+    gender,
+    race,
+    admission_type,
+    admission_location,
+
+    -- 结局指标
+    hospital_expire_flag,
+    icu_mortality,
+    icu_los_hours,
+    icu_los_days,
+
+    -- 临床分类
+    severity_category,
+    organ_failure_flag,
+    failing_organs_count,
+
+    -- 数据质量标记
+    CASE
+        WHEN hourly_measurements >= 24 THEN 'Complete'
+        WHEN hourly_measurements >= 12 THEN 'Partial'
+        WHEN hourly_measurements >= 6 THEN 'Limited'
+        ELSE 'Insufficient'
+    END AS data_completeness,
+
+    -- 首日评分变化趋势
+    CASE
+        WHEN sofa2_first_day_total > sofa2_at_icu_admission THEN 'Worsening'
+        WHEN sofa2_first_day_total < sofa2_at_icu_admission THEN 'Improving'
+        WHEN sofa2_first_day_total = sofa2_at_icu_admission THEN 'Stable'
+        ELSE 'Unknown'
+    END AS trend_first_day
+
+FROM clinical_status;
+
+-- =================================================================
+-- 添加主键和索引
+-- =================================================================
+
+-- 添加主键
+ALTER TABLE mimiciv_derived.first_day_sofa2
+ADD COLUMN first_day_sofa2_id SERIAL PRIMARY KEY;
+
+-- 创建索引提高查询性能
+CREATE INDEX idx_first_day_sofa2_stay_id ON mimiciv_derived.first_day_sofa2(stay_id);
+CREATE INDEX idx_first_day_sofa2_subject_id ON mimiciv_derived.first_day_sofa2(subject_id);
+CREATE INDEX idx_first_day_sofa2_hadm_id ON mimiciv_derived.first_day_sofa2(hadm_id);
+CREATE INDEX idx_first_day_sofa2_sofa2_total ON mimiciv_derived.first_day_sofa2(sofa2);
+CREATE INDEX idx_first_day_sofa2_severity ON mimiciv_derived.first_day_sofa2(severity_category);
+CREATE INDEX idx_first_day_sofa2_mortality ON mimiciv_derived.first_day_sofa2(icu_mortality);
+
+-- =================================================================
+-- 添加表和列注释
+-- =================================================================
+
+-- 表注释
+COMMENT ON TABLE mimiciv_derived.first_day_sofa2 IS
+'首日SOFA2评分表 - 基于ICU入院前6小时至入院后24小时窗口计算的最差SOFA2评分。
+符合SOFA2最新标准(JAMA 2025)，支持大规模临床研究和质量评估。';
+
+-- 列注释
+COMMENT ON COLUMN mimiciv_derived.first_day_sofa2.stay_id IS 'ICU住院ID';
+COMMENT ON COLUMN mimiciv_derived.first_day_sofa2.hadm_id IS '医院住院ID';
+COMMENT ON COLUMN mimiciv_derived.first_day_sofa2.subject_id IS '患者ID';
+COMMENT ON COLUMN mimiciv_derived.first_day_sofa2.icu_intime IS 'ICU入院时间';
+COMMENT ON COLUMN mimiciv_derived.first_day_sofa2.icu_outtime IS 'ICU出院时间';
+COMMENT ON COLUMN mimiciv_derived.first_day_sofa2.sofa2 IS '首日SOFA2总评分(0-24)';
+COMMENT ON COLUMN mimiciv_derived.first_day_sofa2.brain IS '神经系统最差评分(0-4)';
+COMMENT ON COLUMN mimiciv_derived.first_day_sofa2.respiratory IS '呼吸系统最差评分(0-4)';
+COMMENT ON COLUMN mimiciv_derived.first_day_sofa2.cardiovascular IS '心血管系统最差评分(0-4)';
+COMMENT ON COLUMN mimiciv_derived.first_day_sofa2.liver IS '肝脏系统最差评分(0-4)';
+COMMENT ON COLUMN mimiciv_derived.first_day_sofa2.kidney IS '肾脏系统最差评分(0-4)';
+COMMENT ON COLUMN mimiciv_derived.first_day_sofa2.hemostasis IS '凝血系统最差评分(0-4)';
+COMMENT ON COLUMN mimiciv_derived.first_day_sofa2.sofa2_icu_admission IS 'ICU入院时刻SOFA2评分';
+COMMENT ON COLUMN mimiciv_derived.first_day_sofa2.window_start_time IS '评估窗口开始时间(ICU入院前6小时)';
+COMMENT ON COLUMN mimiciv_derived.first_day_sofa2.window_end_time IS '评估窗口结束时间(ICU入院后24小时)';
+COMMENT ON COLUMN mimiciv_derived.first_day_sofa2.total_measurements IS '窗口内小时级评分数量';
+COMMENT ON COLUMN mimiciv_derived.first_day_sofa2.age IS '患者年龄(岁)';
+COMMENT ON COLUMN mimiciv_derived.first_day_sofa2.gender IS '患者性别';
+COMMENT ON COLUMN mimiciv_derived.first_day_sofa2.race IS '患者种族';
+COMMENT ON COLUMN mimiciv_derived.first_day_sofa2.hospital_expire_flag IS '医院死亡结局(1=死亡,0=存活)';
+COMMENT ON COLUMN mimiciv_derived.first_day_sofa2.icu_los_hours IS 'ICU住院时长(小时)';
+COMMENT ON COLUMN mimiciv_derived.first_day_sofa2.severity_category IS '严重程度分类(Minimal/Mild/Moderate/Severe/Critical)';
+COMMENT ON COLUMN mimiciv_derived.first_day_sofa2.organ_failure_flag IS '器官功能衰竭标志(SOFA2>=2)';
+COMMENT ON COLUMN mimiciv_derived.first_day_sofa2.failing_organs_count IS '衰竭器官数量(评分>=2的系统数)';
+COMMENT ON COLUMN mimiciv_derived.first_day_sofa2.data_completeness IS '数据完整性分类(Complete/Partial/Limited/Insufficient)';
+
+-- =================================================================
+-- 生成统计报告
+-- =================================================================
+
+-- 基本统计
+WITH stats AS (
+    SELECT
+        '=== 首日SOFA2评分表生成统计报告 ===' as report_title,
+        '' as metric,
+        '' as value,
+        CURRENT_TIMESTAMP as generation_time
+
+    UNION ALL
+
+    SELECT
+        '数据覆盖范围',
+        '总ICU住院次数',
+        CAST(COUNT(*) AS VARCHAR),
+        NULL
+    FROM mimiciv_derived.first_day_sofa2
+
+    UNION ALL
+
+    SELECT
+        '评分分布',
+        '平均SOFA2评分',
+        CAST(ROUND(AVG(sofa2), 2) AS VARCHAR),
+        NULL
+    FROM mimiciv_derived.first_day_sofa2
+
+    UNION ALL
+
+    SELECT
+        '评分分布',
+        '中位数SOFA2评分',
+        CAST(ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY sofa2)::numeric, 2) AS VARCHAR),
+        NULL
+    FROM mimiciv_derived.first_day_sofa2
+
+    UNION ALL
+
+    SELECT
+        '评分分布',
+        '最高SOFA2评分',
+        CAST(MAX(sofa2) AS VARCHAR),
+        NULL
+    FROM mimiciv_derived.first_day_sofa2
+
+    UNION ALL
+
+    SELECT
+        '严重程度分布',
+        '重症患者比例(SOFA2>=8)',
+        CAST(ROUND(COUNT(CASE WHEN sofa2 >= 8 THEN 1 END) * 100.0 / COUNT(*), 2) AS VARCHAR) || '%',
+        NULL
+    FROM mimiciv_derived.first_day_sofa2
+
+    UNION ALL
+
+    SELECT
+        '器官衰竭分析',
+        '平均衰竭器官数量',
+        CAST(ROUND(AVG(failing_organs_count), 2) AS VARCHAR),
+        NULL
+    FROM mimiciv_derived.first_day_sofa2
+
+    UNION ALL
+
+    SELECT
+        '数据质量',
+        '数据完整性',
+        CAST(COUNT(CASE WHEN data_completeness = 'Complete' THEN 1 END) * 100.0 / COUNT(*) AS VARCHAR) || '%',
+        NULL
+    FROM mimiciv_derived.first_day_sofa2
+)
+SELECT * FROM stats WHERE metric IS NOT NULL OR report_title = '=== 首日SOFA2评分表生成统计报告 ===';
+
+-- 更新表统计信息
+ANALYZE mimiciv_derived.first_day_sofa2;
+
+-- =================================================================
+-- 脚本完成
+-- =================================================================
+SELECT
+    '✅ 首日SOFA2评分表创建完成！' as status,
+    '表名: mimiciv_derived.first_day_sofa2 | 记录数: ' || CAST(COUNT(*) AS VARCHAR) as message,
+    '符合SOFA2最新标准(JAMA 2025)，支持临床研究和质量评估' as notes
+FROM mimiciv_derived.first_day_sofa2;

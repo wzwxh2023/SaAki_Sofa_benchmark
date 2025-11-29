@@ -9,6 +9,7 @@ IFS=$'\n\t'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# 使用原始脚本（sofa2_scores表已重命名，无覆盖风险）
 SQL_FILE="${REPO_ROOT}/sofa2_sql/sofa2_optimized.sql"
 
 if [[ ! -f "${SQL_FILE}" ]]; then
@@ -40,7 +41,6 @@ echo "日志文件：${LOG_FILE}"
     echo "SET work_mem = '1GB';"
     echo "SET maintenance_work_mem = '1GB';"
     echo "SET max_parallel_workers_per_gather = 8;"
-    echo "SET max_parallel_workers = 16;"
     echo "SET temp_buffers = '512MB';"
     echo "SET statement_timeout = 0;"
     echo "SET lock_timeout = 0;"
