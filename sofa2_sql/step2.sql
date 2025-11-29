@@ -1,194 +1,574 @@
 -- =================================================================
 -- 步骤 2: 生成各组件中间表 (UNLOGGED Tables)
 -- =================================================================
-
+-- =================================================================
 -- 2.1 镇静药物 (Sedation)
+-- 数据源: mimiciv_icu.inputevents (精准输注记录)
+-- 逻辑:
+-- 1. 包含核心镇静剂及巴比妥类 (脑保护/深镇静)
+-- 2. 排除纯阿片类镇痛药 (如芬太尼) 以防掩盖真实神经恶化
+-- 3. 增加 1小时 Washout Buffer (停药后1小时内仍视为镇静影响)
+-- =================================================================
+DROP TABLE IF EXISTS mimiciv_derived.sofa2_stage1_sedation CASCADE;
 CREATE UNLOGGED TABLE mimiciv_derived.sofa2_stage1_sedation AS
-WITH sedation_drugs AS (
-    SELECT UNNEST(ARRAY['propofol', 'dexmedetomidine', 'midazolam', 'lorazepam', 'diazepam', 'ketamine', 'clonidine', 'etomidate']) AS drug_name
-),
-sedation_filtered AS (
-    SELECT ie.stay_id, pr.starttime, pr.stoptime
-    FROM mimiciv_icu.icustays ie
-    INNER JOIN mimiciv_hosp.prescriptions pr ON ie.hadm_id = pr.hadm_id
-    WHERE EXISTS (SELECT 1 FROM sedation_drugs sd WHERE LOWER(pr.drug) = sd.drug_name)
-      AND pr.starttime IS NOT NULL AND pr.route IN ('IV DRIP', 'IV', 'Intravenous', 'IVPCA', 'SC', 'IM')
+SELECT 
+    stay_id,
+    starttime,
+    endtime
+FROM mimiciv_icu.inputevents
+WHERE itemid IN (
+    -- === 核心镇静剂 ===
+    222168, -- Propofol (丙泊酚)
+    221668, -- Midazolam (咪达唑仑)
+    229420, -- Dexmedetomidine (右美托咪定 - 主要ID)
+    225150, -- Dexmedetomidine (右美托咪定 - 次要ID)
+    221385, -- Lorazepam (劳拉西泮)
+    221712, -- Ketamine (氯胺酮)
+    221756, -- Etomidate (依托咪酯)
+
+    -- === 巴比妥类 (深度昏迷诱导) ===
+    225156  -- Pentobarbital (戊巴比妥)
 )
-SELECT stay_id, starttime,
-    CASE
-        WHEN stoptime > starttime AND EXTRACT(EPOCH FROM (stoptime - starttime)) BETWEEN 3600 AND 604800 THEN stoptime
-        WHEN stoptime > starttime AND EXTRACT(EPOCH FROM (stoptime - starttime)) < 3600 THEN starttime + INTERVAL '4 hours'
-        WHEN stoptime > starttime AND EXTRACT(EPOCH FROM (stoptime - starttime)) > 604800 THEN starttime + INTERVAL '7 days'
-        ELSE starttime + INTERVAL '24 hours'
-    END AS stoptime
-FROM sedation_filtered;
-CREATE INDEX idx_st1_sedation ON mimiciv_derived.sofa2_stage1_sedation(stay_id, starttime, stoptime);
+AND amount > 0; -- 确保有实际给药
 
--- 2.2 呼吸支持时间段 (Ventilation)
-CREATE UNLOGGED TABLE mimiciv_derived.sofa2_stage1_vent AS
-SELECT stay_id, starttime, endtime, ventilation_status
-FROM mimiciv_derived.ventilation
-WHERE ventilation_status IN ('InvasiveVent', 'NonInvasiveVent', 'HFNC', 'Tracheostomy');
-CREATE INDEX idx_st1_vent ON mimiciv_derived.sofa2_stage1_vent(stay_id, starttime, endtime);
+CREATE INDEX idx_st1_sedation ON mimiciv_derived.sofa2_stage1_sedation(stay_id, starttime, endtime);
 
--- 2.3 SF Ratio (SpO2/FiO2) - 使用通用分组法替代 IGNORE NULLS 以防报错
-CREATE UNLOGGED TABLE mimiciv_derived.sofa2_stage1_sf AS
-WITH raw_timeline AS (
-    -- SpO2 (<98%)
-    SELECT stay_id, charttime, valuenum AS spo2, NULL::numeric AS fio2
-    FROM mimiciv_icu.chartevents WHERE itemid = 220277 AND valuenum > 0 AND valuenum < 98
-    UNION ALL
-    -- FiO2 (ChartEvents, 修复单位)
-    SELECT stay_id, charttime, NULL::numeric AS spo2, CASE WHEN valuenum <= 1.0 THEN valuenum * 100.0 ELSE valuenum END AS fio2
-    FROM mimiciv_icu.chartevents WHERE itemid = 223835 AND valuenum > 0
-    UNION ALL
-    -- FiO2 (Blood Gas, 修复 stay_id)
-    SELECT ie.stay_id, bg.charttime, NULL::numeric AS spo2, bg.fio2
-    FROM mimiciv_derived.bg bg
-    JOIN mimiciv_icu.icustays ie ON bg.subject_id = ie.subject_id 
-        AND bg.charttime BETWEEN ie.intime - INTERVAL '6 HOURS' AND ie.outtime
-    WHERE bg.fio2 IS NOT NULL
-),
-timeline_grouped AS (
-    SELECT stay_id, charttime, spo2, fio2,
-           COUNT(fio2) OVER (PARTITION BY stay_id ORDER BY charttime) as fio2_grp
-    FROM raw_timeline
-),
-imputed AS (
-    SELECT stay_id, charttime, spo2,
-           FIRST_VALUE(fio2) OVER (PARTITION BY stay_id, fio2_grp ORDER BY charttime) AS fio2_val
-    FROM timeline_grouped
+
+-- =================================================================
+-- 2.2 谵妄药物 (Delirium Meds)
+-- 数据源: mimiciv_hosp.prescriptions (医嘱)
+-- 逻辑: 模糊匹配常见抗精神病药物，映射到小时网格
+-- =================================================================
+DROP TABLE IF EXISTS mimiciv_derived.sofa2_stage1_delirium CASCADE;
+CREATE UNLOGGED TABLE mimiciv_derived.sofa2_stage1_delirium AS
+SELECT 
+    ih.stay_id, 
+    ih.hr, 
+    MAX(1) AS on_delirium_med
+FROM mimiciv_derived.icustay_hourly ih
+JOIN mimiciv_icu.icustays ie ON ih.stay_id = ie.stay_id
+JOIN mimiciv_hosp.prescriptions pr ON ie.hadm_id = pr.hadm_id
+WHERE (
+    -- 1. 氟哌啶醇
+    pr.drug ILIKE '%haloperidol%' 
+    
+    -- 2. 喹硫平 (含 Seroquel)
+    OR pr.drug ILIKE '%quetiapine%' OR pr.drug ILIKE '%seroquel%'
+    
+    -- 3. 奥氮平 (含 Zyprexa)
+    OR pr.drug ILIKE '%olanzapine%' OR pr.drug ILIKE '%zyprexa%'
+    
+    -- 4. 利培酮 (含 Risperdal)
+    OR pr.drug ILIKE '%risperidone%' OR pr.drug ILIKE '%risperdal%'
+    
+    -- 5. 齐拉西酮 (含 Geodon)
+    OR pr.drug ILIKE '%ziprasidone%' OR pr.drug ILIKE '%geodon%'
+    
+    -- 6. 氯氮平
+    OR pr.drug ILIKE '%clozapine%'
+    
+    -- 7. 阿立哌唑 (含 Abilify)
+    OR pr.drug ILIKE '%aripiprazole%' OR pr.drug ILIKE '%abilify%'
 )
-SELECT stay_id, charttime, spo2 / (fio2_val / 100.0) AS sf_ratio
-FROM imputed WHERE spo2 IS NOT NULL AND fio2_val IS NOT NULL;
-CREATE INDEX idx_st1_sf ON mimiciv_derived.sofa2_stage1_sf(stay_id, charttime);
+-- 排除外用制剂
+AND pr.drug NOT ILIKE '%TOPICAL%'
+-- 时间窗口匹配
+AND pr.starttime <= ih.endtime
+AND COALESCE(pr.stoptime, pr.starttime + INTERVAL '24 hours') >= ih.endtime - INTERVAL '1 HOUR'
+GROUP BY ih.stay_id, ih.hr;
 
--- 2.4 机械循环支持 (Mech Support)
-CREATE UNLOGGED TABLE mimiciv_derived.sofa2_stage1_mech AS
-SELECT ce.stay_id, ce.charttime,
-    CASE WHEN ce.itemid IN (224660, 229270, 229272, 229268, 229271, 229277, 229278, 229280, 229276, 229274, 229266, 229363, 229364, 229365, 229269, 229275, 229267, 229273, 228193, 229256, 229258, 229264, 229250, 229262, 229254, 229252, 229260) THEN 1 ELSE 0 END AS is_ecmo,
-    CASE WHEN ce.itemid IN (224322, 227980, 225988, 228866, 225339, 225982, 226110, 225985, 225986, 225341, 225981, 225979, 225987, 225342, 225984, 225980, 227754, 227355, 225742, 228154, 229679, 228173, 228164, 228162, 228174, 229680, 229897, 229671, 228171, 228172, 228167, 228170, 224314, 224318, 229898, 220128, 220125, 229899, 229900, 229256, 229258, 229264, 229250, 229262, 229254, 229252, 229260, 228223, 228226, 228219, 228225, 228222, 228224, 228203, 228227, 229263, 229255, 229259, 229257, 229265, 229251, 229253, 229261, 229560, 229559, 228187, 228867) THEN 1 ELSE 0 END AS is_other_mech
-FROM mimiciv_icu.chartevents ce
-WHERE ce.itemid IN (224660, 229270, 229272, 229268, 229271, 229277, 229278, 229280, 229276, 229274, 229266, 229363, 229364, 229365, 229269, 229275, 229267, 229273, 228193, 229256, 229258, 229264, 229250, 229262, 229254, 229252, 229260, 224322, 227980, 225988, 228866, 225339, 225982, 226110, 225985, 225986, 225341, 225981, 225979, 225987, 225342, 225984, 225980, 227754, 227355, 225742, 228154, 229679, 228173, 228164, 228162, 228174, 229680, 229897, 229671, 228171, 228172, 228167, 228170, 224314, 224318, 229898, 220128, 220125, 229899, 229900, 229256, 229258, 229264, 229250, 229262, 229254, 229252, 229260, 228223, 228226, 228219, 228225, 228222, 228224, 228203, 228227, 229263, 229255, 229259, 229257, 229265, 229251, 229253, 229261, 229560, 229559, 228187, 228867);
-CREATE INDEX idx_st1_mech ON mimiciv_derived.sofa2_stage1_mech(stay_id, charttime);
+CREATE INDEX idx_st1_delirium ON mimiciv_derived.sofa2_stage1_delirium(stay_id, hr);
 
--- 2.5 胆红素 (Bilirubin)
-CREATE UNLOGGED TABLE mimiciv_derived.sofa2_stage1_bilirubin AS
-SELECT stay.stay_id, enz.charttime, enz.bilirubin_total
-FROM mimiciv_icu.icustays stay
-JOIN mimiciv_derived.enzyme enz ON stay.hadm_id = enz.hadm_id
-WHERE enz.bilirubin_total IS NOT NULL AND enz.charttime >= stay.intime - INTERVAL '6 HOURS' AND enz.charttime <= stay.outtime;
-CREATE INDEX idx_st1_bili ON mimiciv_derived.sofa2_stage1_bilirubin(stay_id, charttime);
 
--- 2.6 肾脏 Lab (Kidney Labs)
-CREATE UNLOGGED TABLE mimiciv_derived.sofa2_stage1_kidney_labs AS
-SELECT stay.stay_id, bg.charttime, chem.creatinine, bg.potassium, bg.ph, bg.bicarbonate
-FROM mimiciv_icu.icustays stay
-LEFT JOIN mimiciv_derived.chemistry chem ON stay.hadm_id = chem.hadm_id AND chem.charttime BETWEEN stay.intime - INTERVAL '6 HOURS' AND stay.outtime
-LEFT JOIN mimiciv_derived.bg bg ON stay.subject_id = bg.subject_id AND bg.charttime BETWEEN stay.intime - INTERVAL '6 HOURS' AND stay.outtime AND bg.specimen = 'ART.'
-WHERE chem.creatinine IS NOT NULL OR bg.ph IS NOT NULL;
-CREATE INDEX idx_st1_klabs ON mimiciv_derived.sofa2_stage1_kidney_labs(stay_id, charttime);
-
--- 2.7 RRT 疗程 (RRT Periods - 72h gap logic)
-CREATE UNLOGGED TABLE mimiciv_derived.sofa2_stage1_rrt AS
-WITH rrt_raw AS (SELECT stay_id, charttime FROM mimiciv_derived.rrt WHERE dialysis_present = 1),
-rrt_groups AS (SELECT stay_id, charttime, CASE WHEN EXTRACT(EPOCH FROM (charttime - LAG(charttime) OVER (PARTITION BY stay_id ORDER BY charttime)))/3600 > 72 THEN 1 ELSE 0 END AS is_new_episode FROM rrt_raw),
-rrt_episodes AS (SELECT stay_id, charttime, SUM(is_new_episode) OVER (PARTITION BY stay_id ORDER BY charttime) AS episode_id FROM rrt_groups)
-SELECT stay_id, MIN(charttime) AS start_time, MAX(charttime) AS end_time FROM rrt_episodes GROUP BY stay_id, episode_id;
-CREATE INDEX idx_st1_rrt ON mimiciv_derived.sofa2_stage1_rrt(stay_id, start_time, end_time);
-
--- 2.8 尿量滑动窗口 (Urine Windows)
-CREATE UNLOGGED TABLE mimiciv_derived.sofa2_stage1_urine AS
-WITH weight_data AS (SELECT stay_id, AVG(weight) as weight FROM mimiciv_derived.weight_durations WHERE weight > 0 GROUP BY stay_id),
-uo_hourly AS (
-    SELECT ih.stay_id, ih.hr, SUM(uo.urineoutput) AS uo_hourly_vol, MAX(wd.weight) as patient_weight
-    FROM mimiciv_derived.icustay_hourly ih
-    JOIN weight_data wd ON ih.stay_id = wd.stay_id
-    LEFT JOIN mimiciv_derived.urine_output uo ON ih.stay_id = uo.stay_id AND uo.charttime >= ih.endtime - INTERVAL '1 HOUR' AND uo.charttime < ih.endtime
-    GROUP BY ih.stay_id, ih.hr
-)
-SELECT stay_id, hr, patient_weight,
-    SUM(uo_hourly_vol) OVER w6 AS uo_sum_6h, COUNT(uo_hourly_vol) OVER w6 AS cnt_6h,
-    SUM(uo_hourly_vol) OVER w12 AS uo_sum_12h, COUNT(uo_hourly_vol) OVER w12 AS cnt_12h,
-    SUM(uo_hourly_vol) OVER w24 AS uo_sum_24h, COUNT(uo_hourly_vol) OVER w24 AS cnt_24h
-FROM uo_hourly
-WINDOW 
-    w6 AS (PARTITION BY stay_id ORDER BY hr ROWS BETWEEN 5 PRECEDING AND CURRENT ROW),
-    w12 AS (PARTITION BY stay_id ORDER BY hr ROWS BETWEEN 11 PRECEDING AND CURRENT ROW),
-    w24 AS (PARTITION BY stay_id ORDER BY hr ROWS BETWEEN 23 PRECEDING AND CURRENT ROW);
-CREATE INDEX idx_st1_urine ON mimiciv_derived.sofa2_stage1_urine(stay_id, hr);
-
--- 2.9 血小板 (Platelets)
-CREATE UNLOGGED TABLE mimiciv_derived.sofa2_stage1_platelets AS
-SELECT stay.stay_id, cbc.charttime, cbc.platelet
-FROM mimiciv_icu.icustays stay
-JOIN mimiciv_derived.complete_blood_count cbc ON stay.hadm_id = cbc.hadm_id
-WHERE cbc.platelet IS NOT NULL AND cbc.charttime >= stay.intime - INTERVAL '6 HOURS' AND cbc.charttime <= stay.outtime;
-CREATE INDEX idx_st1_plt ON mimiciv_derived.sofa2_stage1_platelets(stay_id, charttime);
-
--- -----------------------------------------------------------------
--- 10. 神经系统 GCS (Brain) - 预计算优化版
--- 逻辑：提前计算好每个时间段的有效 GCS 分数，避免主查询逐行扫描
--- -----------------------------------------------------------------
+-- =================================================================
+-- 2.3 神经系统 GCS (Brain) - 核心评分表
+-- 逻辑: 
+-- 1. 修正插管误判 (gcs_unable=1 时强制用 Motor)
+-- 2. 评分优先级: Total GCS > Motor GCS
+-- 3. 镇静回溯 (LOCF): 镇静时沿用最近一次清醒分
+-- =================================================================
 DROP TABLE IF EXISTS mimiciv_derived.sofa2_stage1_brain CASCADE;
-
 CREATE UNLOGGED TABLE mimiciv_derived.sofa2_stage1_brain AS
+
+-- A. 计算单次记录的 Raw SOFA Score
 WITH gcs_base AS (
-    -- 1. 标记每个 GCS 记录是否处于镇静状态
     SELECT 
         g.stay_id, 
         g.charttime, 
-        g.gcs,
-        -- 关联之前生成的镇静表，判断当前时刻是否有镇静
+        
+        CASE 
+            -- 场景 A: 插管状态 (unable=1) -> 强制用 Motor
+            WHEN g.gcs_unable = 1 THEN 
+                CASE 
+                    WHEN g.gcs_motor <= 2 THEN 4
+                    WHEN g.gcs_motor = 3 THEN 3
+                    WHEN g.gcs_motor = 4 THEN 2
+                    WHEN g.gcs_motor = 5 THEN 1
+                    WHEN g.gcs_motor = 6 THEN 0
+                    ELSE NULL 
+                END
+            
+            -- 场景 B: 非插管 -> 优先 Total, 兜底 Motor
+            ELSE COALESCE(
+                -- Total GCS 映射
+                CASE 
+                    WHEN g.gcs <= 5 THEN 4
+                    WHEN g.gcs <= 8 THEN 3
+                    WHEN g.gcs <= 12 THEN 2
+                    WHEN g.gcs <= 14 THEN 1
+                    WHEN g.gcs = 15 THEN 0
+                    ELSE NULL 
+                END,
+                -- Motor GCS 映射
+                CASE 
+                    WHEN g.gcs_motor <= 2 THEN 4
+                    WHEN g.gcs_motor = 3 THEN 3
+                    WHEN g.gcs_motor = 4 THEN 2
+                    WHEN g.gcs_motor = 5 THEN 1
+                    WHEN g.gcs_motor = 6 THEN 0
+                    ELSE NULL 
+                END
+            )
+        END AS brain_score_raw,
+        
+        -- 标记是否镇静 (关联上面生成的 2.1 表)
         CASE WHEN s.stay_id IS NOT NULL THEN 1 ELSE 0 END AS is_sedated
+
     FROM mimiciv_derived.gcs g
     LEFT JOIN mimiciv_derived.sofa2_stage1_sedation s 
       ON g.stay_id = s.stay_id 
       AND g.charttime >= s.starttime 
-      AND g.charttime <= s.stoptime
+      AND g.charttime <= s.endtime
 ),
-gcs_locf AS (
-    -- 2. 寻找"最近一次未镇静的 GCS" (LOCF逻辑)
+
+-- B. 准备 LOCF 分组 (仅未镇静时产生有效值)
+gcs_grouping AS (
     SELECT 
-        stay_id, charttime, gcs, is_sedated,
-        -- 技巧：生成分组ID。只有遇到未镇静的记录，组号才+1
-        COUNT(CASE WHEN is_sedated = 0 THEN 1 END) OVER (PARTITION BY stay_id ORDER BY charttime) as grp
+        stay_id, 
+        charttime, 
+        is_sedated,
+        CASE WHEN is_sedated = 0 THEN brain_score_raw ELSE NULL END AS valid_score,
+        -- 分组计数: 遇到未镇静记录时 +1
+        COUNT(CASE WHEN is_sedated = 0 THEN 1 END) 
+            OVER (PARTITION BY stay_id ORDER BY charttime) as grp
     FROM gcs_base
 ),
+
+-- C. 执行回溯
 gcs_resolved AS (
-    -- 3. 确定有效 GCS 值
     SELECT 
-        stay_id, charttime,
-        -- 如果当前镇静，取当前组的第一条(即最近一次未镇静值)；若无回溯值，则被迫用当前值
-        CASE 
-            WHEN is_sedated = 1 THEN 
-                COALESCE(FIRST_VALUE(gcs) OVER (PARTITION BY stay_id, grp ORDER BY charttime), gcs)
-            ELSE gcs 
-        END as effective_gcs
-    FROM gcs_locf
-),
-gcs_scored AS (
-    -- 4. 将 GCS 值转换为 SOFA 分数 (0-4分)
-    SELECT 
-        stay_id, charttime,
-        CASE 
-            WHEN effective_gcs <= 5 THEN 4 
-            WHEN effective_gcs <= 8 THEN 3 
-            WHEN effective_gcs <= 12 THEN 2 
-            WHEN effective_gcs <= 14 THEN 1 
-            ELSE 0 
-        END as brain_score_raw
-    FROM gcs_resolved
+        stay_id, 
+        charttime,
+        -- 取当前组内的第一个有效值 (实现回溯)
+        FIRST_VALUE(valid_score) OVER (
+            PARTITION BY stay_id, grp ORDER BY charttime
+        ) AS effective_score
+    FROM gcs_grouping
 )
--- 5. 生成时间区间表 (从当前记录开始，持续到下一条记录出现)
+
+-- D. 生成最终区间表
 SELECT 
     stay_id, 
     charttime AS starttime,
-    -- 下一条记录的时间作为当前分数的结束时间
     LEAD(charttime, 1, 'infinity'::timestamp) OVER (PARTITION BY stay_id ORDER BY charttime) AS endtime,
-    brain_score_raw
-FROM gcs_scored;
+    -- 默认值: 若无历史记录(刚入科即镇静)，默认为 0
+    COALESCE(effective_score, 0) AS brain_score_final
+FROM gcs_resolved;
 
--- 建立区间索引 (极速 Range Join 的关键)
 CREATE INDEX idx_st1_brain ON mimiciv_derived.sofa2_stage1_brain(stay_id, starttime, endtime);
-ANALYZE mimiciv_derived.sofa2_stage1_brain;
+-- =================================================================
+-- =================================================================
+-- Step 2: 呼吸系统组件预处理 (Respiratory Staging)
+-- 包含: 呼吸支持状态、机械循环支持(ECMO)、氧合指数
+-- =================================================================
+
+-- -----------------------------------------------------------------
+-- 2.4 呼吸支持状态 (Respiratory Support)
+-- 来源: mimiciv_derived.ventilation
+-- 逻辑: 包含 HFNC, NIV, Invasive, Trach (满足 SOFA 3-4分条件)
+-- -----------------------------------------------------------------
+DROP TABLE IF EXISTS mimiciv_derived.sofa2_stage1_resp_support;
+CREATE UNLOGGED TABLE mimiciv_derived.sofa2_stage1_resp_support AS
+SELECT 
+    ih.stay_id,
+    ih.hr,
+    MAX(1) AS with_resp_support
+FROM mimiciv_derived.icustay_hourly ih
+JOIN mimiciv_derived.ventilation v 
+    ON ih.stay_id = v.stay_id
+WHERE
+    -- 时间重叠判断
+    ih.endtime > v.starttime
+    AND ih.endtime - INTERVAL '1 HOUR' < v.endtime
+    -- 必须属于高级支持类型
+    AND v.ventilation_status IN (
+        'InvasiveVent', 
+        'NonInvasiveVent', 
+        'Tracheostomy', 
+        'HFNC'
+    )
+GROUP BY ih.stay_id, ih.hr;
+
+CREATE INDEX idx_st1_resp_sup 
+ON mimiciv_derived.sofa2_stage1_resp_support(stay_id, hr);
+
+-- -----------------------------------------------------------------
+-- 2.5 机械循环支持 (Mech Support / ECMO) - 增强版：区分VV/VA-ECMO
+-- 根据 itemid=229268 (Circuit Configuration) 区分ECMO类型
+-- 数据分布: VV=17950, VA=9926, ---=290, VAV=41
+-- -----------------------------------------------------------------
+DROP TABLE IF EXISTS mimiciv_derived.sofa2_stage1_mech;
+CREATE UNLOGGED TABLE mimiciv_derived.sofa2_stage1_mech AS
+SELECT 
+    ih.stay_id, 
+    ih.hr,
+    
+    -- 1. 检测是否有ECMO（任何类型）
+    MAX(CASE WHEN ce.itemid IN (
+        224660, 229270, 229277, 229280, 229278, 229363, 229364, 229365, 228193
+    ) THEN 1 ELSE 0 END) AS is_ecmo,
+    
+    -- 2. VV-ECMO
+    MAX(CASE WHEN ce.itemid = 229268 AND ce.value = 'VV'
+         THEN 1 ELSE 0 END) AS is_vv_ecmo,
+    
+    -- 3. VA/VAV-ECMO
+    MAX(CASE WHEN ce.itemid = 229268 AND ce.value IN ('VA', 'VAV')
+         THEN 1 ELSE 0 END) AS is_va_ecmo,
+    
+    -- 4. ECMO类型未知
+    MAX(CASE WHEN ce.itemid = 229268 AND (ce.value = '---' OR ce.value IS NULL OR ce.value = '')
+         THEN 1 ELSE 0 END) AS is_ecmo_unknown_type,
+    
+    -- 5. 其他机械支持
+    MAX(CASE WHEN ce.itemid IN (
+        224322, 227980, 225980, 228866,
+        228154, 229671, 229897, 229898, 229899, 229900,
+        220125, 220128, 229254, 229262, 229255, 229263
+    ) THEN 1 ELSE 0 END) AS is_other_mech
+
+FROM mimiciv_derived.icustay_hourly ih
+LEFT JOIN mimiciv_icu.chartevents ce           -- ✅ 改为 LEFT JOIN
+    ON ih.stay_id = ce.stay_id
+    AND ce.charttime >= ih.endtime - INTERVAL '1 HOUR' 
+    AND ce.charttime <= ih.endtime
+    AND ce.itemid IN (                          -- ✅ 条件移到ON子句
+        224660, 229270, 229277, 229280, 229278, 229363, 229364, 229365, 228193,
+        229268,
+        224322, 227980, 225980, 228866,
+        228154, 229671, 229897, 229898, 229899, 229900,
+        220125, 220128, 229254, 229262, 229255, 229263
+    )
+GROUP BY ih.stay_id, ih.hr;                     -- ✅ 移除WHERE子句
+
+CREATE INDEX idx_st1_mech ON mimiciv_derived.sofa2_stage1_mech(stay_id, hr);
+
+-- 2.6 氧合指数 (Oxygenation)
+-- 逻辑: 1小时窗口精确匹配
+-- -----------------------------------------------------------------
+DROP TABLE IF EXISTS mimiciv_derived.sofa2_stage1_oxygen;
+CREATE UNLOGGED TABLE mimiciv_derived.sofa2_stage1_oxygen AS
+
+-- A. FiO2: 整合 Chartevents 和 BloodGas（优先级处理）
+WITH fio2_raw AS (
+    SELECT stay_id, charttime, fio2, source,
+           ROW_NUMBER() OVER (
+               PARTITION BY stay_id, charttime 
+               ORDER BY priority
+           ) as rn
+    FROM (
+        -- 血气来源：优先级1（更准确）
+        SELECT ie.stay_id, bg.charttime, bg.fio2, 'bg' as source, 1 as priority
+        FROM mimiciv_derived.bg bg
+        JOIN mimiciv_icu.icustays ie 
+            ON bg.hadm_id = ie.hadm_id
+            AND bg.charttime >= ie.intime 
+            AND bg.charttime <= ie.outtime
+        WHERE bg.fio2 IS NOT NULL
+        
+        UNION ALL
+        
+        -- Chartevents来源：优先级2
+        SELECT stay_id, charttime, valuenum AS fio2, 'ce' as source, 2 as priority
+        FROM mimiciv_icu.chartevents 
+        WHERE itemid = 223835 AND valuenum > 0
+    ) x
+),
+fio2_all AS (
+    SELECT stay_id, charttime, fio2
+    FROM fio2_raw
+    WHERE rn = 1
+),
+
+-- B. SpO2: 仅 Chartevents
+spo2_all AS (
+    SELECT stay_id, charttime, valuenum AS spo2 
+    FROM mimiciv_icu.chartevents 
+    WHERE itemid = 220277 AND valuenum > 0 AND valuenum <= 100
+),
+
+-- C. PaO2: 仅动脉血气（需要JOIN获取stay_id）
+pao2_all AS (
+    SELECT ie.stay_id, bg.charttime, bg.po2 AS pao2 
+    FROM mimiciv_derived.bg bg
+    JOIN mimiciv_icu.icustays ie 
+        ON bg.hadm_id = ie.hadm_id
+        AND bg.charttime >= ie.intime 
+        AND bg.charttime <= ie.outtime
+    WHERE bg.specimen = 'ART.' AND bg.po2 IS NOT NULL
+)
+
+SELECT 
+    ih.stay_id,
+    ih.hr,
+    
+    -- 1. 计算 PF Ratio
+    (
+        (ARRAY_AGG(p.pao2 ORDER BY p.charttime DESC))[1] 
+        / 
+        NULLIF(COALESCE(
+            (ARRAY_AGG(f.fio2 ORDER BY f.charttime DESC))[1], 
+            21
+        ), 0)
+        * 100
+    ) AS pf_ratio,
+
+    -- 2. 计算 SF Ratio
+    (
+        (ARRAY_AGG(s.spo2 ORDER BY s.charttime DESC))[1] 
+        / 
+        NULLIF(COALESCE(
+            (ARRAY_AGG(f.fio2 ORDER BY f.charttime DESC))[1], 
+            21
+        ), 0)
+        * 100
+    ) AS sf_ratio,
+    
+    -- 3. 原始 SpO2 (用于 Step 3 过滤 <98%)
+    (ARRAY_AGG(s.spo2 ORDER BY s.charttime DESC))[1] AS raw_spo2
+
+FROM mimiciv_derived.icustay_hourly ih
+LEFT JOIN pao2_all p 
+    ON ih.stay_id = p.stay_id 
+    AND p.charttime > ih.endtime - INTERVAL '1 HOUR' 
+    AND p.charttime <= ih.endtime
+LEFT JOIN spo2_all s 
+    ON ih.stay_id = s.stay_id 
+    AND s.charttime > ih.endtime - INTERVAL '1 HOUR' 
+    AND s.charttime <= ih.endtime
+LEFT JOIN fio2_all f 
+    ON ih.stay_id = f.stay_id 
+    AND f.charttime > ih.endtime - INTERVAL '1 HOUR' 
+    AND f.charttime <= ih.endtime
+WHERE ih.hr >= -24
+GROUP BY ih.stay_id, ih.hr;
+
+CREATE INDEX idx_st1_oxy ON mimiciv_derived.sofa2_stage1_oxygen(stay_id, hr);
+
+-- =================================================================
+-- 2.9 肾脏 Lab (Kidney Labs)
+-- 优化: 直接生成小时级 Lab 数据，向前回溯 6 小时取极值
+-- =================================================================
+DROP TABLE IF EXISTS mimiciv_derived.sofa2_stage1_kidney_labs;
+CREATE UNLOGGED TABLE mimiciv_derived.sofa2_stage1_kidney_labs AS
+SELECT
+    ih.stay_id,
+    ih.hr,
+    MAX(chem.creatinine) AS creatinine,
+    GREATEST(MAX(chem.potassium), MAX(bg.potassium)) AS potassium,
+    MIN(bg.ph) AS ph,
+    LEAST(MIN(chem.bicarbonate), MIN(bg.bicarbonate)) AS bicarbonate
+FROM mimiciv_derived.icustay_hourly ih
+INNER JOIN mimiciv_icu.icustays ie ON ih.stay_id = ie.stay_id
+LEFT JOIN mimiciv_derived.chemistry chem
+    ON ie.subject_id = chem.subject_id
+    AND chem.charttime > ih.endtime - INTERVAL '1 HOUR'   -- ✅ 改为1小时
+    AND chem.charttime <= ih.endtime
+LEFT JOIN mimiciv_derived.bg bg
+    ON ie.subject_id = bg.subject_id
+    AND bg.charttime > ih.endtime - INTERVAL '1 HOUR'     -- ✅ 改为1小时
+    AND bg.charttime <= ih.endtime
+WHERE ih.hr >= -24
+GROUP BY ih.stay_id, ih.hr;
+
+CREATE INDEX idx_st1_klabs ON mimiciv_derived.sofa2_stage1_kidney_labs(stay_id, hr);
+
+
+-- =================================================================
+-- 2.10 RRT 状态 (Hourly RRT Status)
+-- 优化: 改为小时级状态，包含腹透判定 (present OR active)
+-- =================================================================
+DROP TABLE IF EXISTS mimiciv_derived.sofa2_stage1_rrt;
+CREATE UNLOGGED TABLE mimiciv_derived.sofa2_stage1_rrt AS
+SELECT 
+    ih.stay_id,
+    ih.hr,
+    -- 只要 dialysis_present=1 (在周期内) 或 active=1 (正在透) 都算 RRT
+    MAX(CASE WHEN rrt.dialysis_present = 1 OR rrt.dialysis_active = 1 THEN 1 ELSE 0 END) AS on_rrt
+FROM mimiciv_derived.icustay_hourly ih
+LEFT JOIN mimiciv_derived.rrt rrt 
+    ON ih.stay_id = rrt.stay_id
+    AND rrt.charttime >= ih.endtime - INTERVAL '1 HOUR'
+    AND rrt.charttime <= ih.endtime
+WHERE ih.hr >= -24
+GROUP BY ih.stay_id, ih.hr;
+
+CREATE INDEX idx_st1_rrt ON mimiciv_derived.sofa2_stage1_rrt(stay_id, hr);
+
+
+-- =================================================================
+-- 2.11 尿量滑动窗口 (Urine Windows - Dynamic Rate)
+-- 优化:
+-- 1. 体重三级兜底 (Admission -> First Day -> Avg)
+-- 2. COUNT(*) 动态分母解决短住院问题
+-- =================================================================
+DROP TABLE IF EXISTS mimiciv_derived.sofa2_stage1_urine;
+CREATE UNLOGGED TABLE mimiciv_derived.sofa2_stage1_urine AS
+
+-- 1. 准备体重
+WITH weight_avg_whole_stay AS (
+    SELECT stay_id, AVG(weight) as weight_full_avg
+    FROM mimiciv_derived.weight_durations
+    WHERE weight > 0
+    GROUP BY stay_id
+),
+-- 第4级：从chartevents获取体重（处理单位转换）
+weight_from_ce AS (
+    SELECT 
+        stay_id, 
+        AVG(
+            CASE 
+                WHEN itemid = 226531 THEN valuenum * 0.453592  -- lbs → kg
+                ELSE valuenum                                   -- 已经是kg
+            END
+        ) as weight_ce
+    FROM mimiciv_icu.chartevents
+    WHERE itemid IN (224639, 226512, 226531)
+      AND valuenum > 0 
+      AND (
+          (itemid IN (224639, 226512) AND valuenum BETWEEN 20 AND 300)
+          OR 
+          (itemid = 226531 AND valuenum BETWEEN 44 AND 660)
+      )
+    GROUP BY stay_id
+),
+-- 五级兜底：整合所有来源
+weight_final AS (
+    SELECT 
+        ie.stay_id,
+        COALESCE(
+            fd.weight_admit,                    -- 1. 入院体重
+            fd.weight,                          -- 2. 首日均值
+            ws.weight_full_avg,                 -- 3. 全程均值
+            ce.weight_ce,                       -- 4. chartevents原始
+            CASE WHEN p.gender = 'F' THEN 70.0  -- 5. 性别中位数（女）
+                 ELSE 83.3                      -- 5. 性别中位数（男）
+            END
+        ) AS weight
+    FROM mimiciv_icu.icustays ie
+    JOIN mimiciv_hosp.patients p ON ie.subject_id = p.subject_id
+    LEFT JOIN mimiciv_derived.first_day_weight fd ON ie.stay_id = fd.stay_id
+    LEFT JOIN weight_avg_whole_stay ws ON ie.stay_id = ws.stay_id
+    LEFT JOIN weight_from_ce ce ON ie.stay_id = ce.stay_id
+),
+
+-- 2. 准备网格数据
+uo_grid AS (
+    SELECT 
+        ih.stay_id, 
+        ih.hr,
+        ih.endtime,
+        COALESCE(SUM(uo.urineoutput), 0) AS uo_vol_hourly
+    FROM mimiciv_derived.icustay_hourly ih
+    LEFT JOIN mimiciv_derived.urine_output uo 
+           ON ih.stay_id = uo.stay_id 
+           AND uo.charttime > ih.endtime - INTERVAL '1 HOUR' 
+           AND uo.charttime <= ih.endtime
+    WHERE ih.hr >= -24
+    GROUP BY ih.stay_id, ih.hr, ih.endtime
+)
+
+-- 3. 计算滑动窗口
+SELECT 
+    g.stay_id,
+    g.hr,
+    w.weight,
+    
+    SUM(uo_vol_hourly) OVER w6 AS uo_sum_6h,
+    SUM(uo_vol_hourly) OVER w12 AS uo_sum_12h,
+    SUM(uo_vol_hourly) OVER w24 AS uo_sum_24h,
+    
+    COUNT(*) OVER w6 AS cnt_6h,
+    COUNT(*) OVER w12 AS cnt_12h,
+    COUNT(*) OVER w24 AS cnt_24h
+
+FROM uo_grid g
+JOIN weight_final w ON g.stay_id = w.stay_id
+WINDOW 
+    w6  AS (PARTITION BY g.stay_id ORDER BY g.hr ROWS BETWEEN 5 PRECEDING AND CURRENT ROW),
+    w12 AS (PARTITION BY g.stay_id ORDER BY g.hr ROWS BETWEEN 11 PRECEDING AND CURRENT ROW),
+    w24 AS (PARTITION BY g.stay_id ORDER BY g.hr ROWS BETWEEN 23 PRECEDING AND CURRENT ROW);
+
+CREATE INDEX idx_st1_urine ON mimiciv_derived.sofa2_stage1_urine(stay_id, hr);
+
+-- =================================================================
+-- Step 2: 补充模块预处理 (Coagulation & Liver)
+-- 策略: 48小时窗口回溯 (LOCF)，基于 MIMIC-IV 数据分布特征优化
+-- =================================================================
+
+-- -----------------------------------------------------------------
+-- 2.12 凝血系统 (Coagulation)
+-- -----------------------------------------------------------------
+DROP TABLE IF EXISTS mimiciv_derived.sofa2_stage1_coag;
+CREATE UNLOGGED TABLE mimiciv_derived.sofa2_stage1_coag AS
+
+WITH plt_raw AS (
+    SELECT hadm_id, charttime, platelet 
+    FROM mimiciv_derived.complete_blood_count 
+    WHERE platelet IS NOT NULL
+)
+
+SELECT 
+    ih.stay_id, 
+    ih.hr,
+    MIN(p.platelet) AS platelet_min
+FROM mimiciv_derived.icustay_hourly ih
+JOIN mimiciv_icu.icustays ie ON ih.stay_id = ie.stay_id
+LEFT JOIN plt_raw p 
+    ON ie.hadm_id = p.hadm_id
+    AND p.charttime > ih.endtime - INTERVAL '48 HOUR' 
+    AND p.charttime <= ih.endtime
+WHERE ih.hr >= -24
+GROUP BY ih.stay_id, ih.hr;
+
+CREATE INDEX idx_st1_coag ON mimiciv_derived.sofa2_stage1_coag(stay_id, hr);
+
+
+-- -----------------------------------------------------------------
+-- 2.13 肝脏系统 (Liver)
+-- 数据源: mimiciv_derived.enzyme (确认包含 bilirubin_total)
+-- 逻辑: 取过去 48 小时内最高的总胆红素 (Bilirubin)
+-- -----------------------------------------------------------------
+DROP TABLE IF EXISTS mimiciv_derived.sofa2_stage1_liver;
+CREATE UNLOGGED TABLE mimiciv_derived.sofa2_stage1_liver AS
+
+WITH bili_raw AS (
+    SELECT hadm_id, charttime, bilirubin_total 
+    FROM mimiciv_derived.enzyme 
+    WHERE bilirubin_total IS NOT NULL
+)
+
+SELECT 
+    ih.stay_id, 
+    ih.hr,
+    MAX(b.bilirubin_total) AS bilirubin_max
+FROM mimiciv_derived.icustay_hourly ih
+JOIN mimiciv_icu.icustays ie ON ih.stay_id = ie.stay_id
+LEFT JOIN bili_raw b 
+    ON ie.hadm_id = b.hadm_id
+    AND b.charttime > ih.endtime - INTERVAL '48 HOUR' 
+    AND b.charttime <= ih.endtime
+WHERE ih.hr >= -24
+GROUP BY ih.stay_id, ih.hr;
+
+CREATE INDEX idx_st1_liver ON mimiciv_derived.sofa2_stage1_liver(stay_id, hr);
