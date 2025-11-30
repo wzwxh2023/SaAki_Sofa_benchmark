@@ -47,6 +47,7 @@ patient_info AS (
         subject_id,
         gender,
         anchor_age,
+        anchor_year,
         dod
     FROM mimiciv_hosp.patients
 ),
