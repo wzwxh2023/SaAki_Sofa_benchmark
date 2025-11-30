@@ -142,3 +142,4 @@ results/
 # Temporary files
 tmp/
 temp/
+.Rproj.user
