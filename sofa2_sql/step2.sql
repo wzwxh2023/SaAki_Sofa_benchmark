@@ -478,7 +478,7 @@ uo_grid AS (
         ih.stay_id, 
         ih.hr,
         ih.endtime,
-        COALESCE(SUM(uo.urineoutput), 0) AS uo_vol_hourly
+        SUM(uo.urineoutput) AS uo_vol_hourly
     FROM mimiciv_derived.icustay_hourly ih
     LEFT JOIN mimiciv_derived.urine_output uo 
            ON ih.stay_id = uo.stay_id 
@@ -489,35 +489,51 @@ uo_grid AS (
 )
 
 -- 3. 计算滑动窗口
-SELECT 
+SELECT
     g.stay_id,
     g.hr,
     w.weight,
-    
+
     SUM(uo_vol_hourly) OVER w6 AS uo_sum_6h,
     SUM(uo_vol_hourly) OVER w12 AS uo_sum_12h,
     SUM(uo_vol_hourly) OVER w24 AS uo_sum_24h,
-    
+
     COUNT(*) OVER w6 AS cnt_6h,
     COUNT(*) OVER w12 AS cnt_12h,
-    COUNT(*) OVER w24 AS cnt_24h
+    COUNT(*) OVER w24 AS cnt_24h,
+
+    -- **修复：根据实际可用时间计算尿量速率**
+    CASE
+        WHEN g.hr >= 0 AND w.weight > 0 THEN
+            CASE
+                WHEN g.hr >= 24 THEN SUM(uo_vol_hourly) OVER w24 / w.weight / 24  -- 有完整24小时数据
+                WHEN g.hr >= 12 THEN SUM(uo_vol_hourly) OVER w12 / w.weight / 12  -- 有12小时数据
+                WHEN g.hr >= 6 THEN SUM(uo_vol_hourly) OVER w6 / w.weight / 6    -- 有6小时数据
+                ELSE NULL  -- 前6小时数据不足，不评估尿量速率
+            END
+        ELSE NULL
+    END AS urine_rate_ml_kg_h,
+
+    -- **标记数据是否足够进行评分**
+    CASE
+        WHEN g.hr >= 24 THEN 'full_24h'
+        WHEN g.hr >= 12 THEN 'full_12h'
+        WHEN g.hr >= 6 THEN 'full_6h'
+        ELSE 'insufficient'
+    END AS time_window_status
 
 FROM uo_grid g
 JOIN weight_final w ON g.stay_id = w.stay_id
-WINDOW 
+WINDOW
     w6  AS (PARTITION BY g.stay_id ORDER BY g.hr ROWS BETWEEN 5 PRECEDING AND CURRENT ROW),
     w12 AS (PARTITION BY g.stay_id ORDER BY g.hr ROWS BETWEEN 11 PRECEDING AND CURRENT ROW),
     w24 AS (PARTITION BY g.stay_id ORDER BY g.hr ROWS BETWEEN 23 PRECEDING AND CURRENT ROW);
 
 CREATE INDEX idx_st1_urine ON mimiciv_derived.sofa2_stage1_urine(stay_id, hr);
 
--- =================================================================
--- Step 2: 补充模块预处理 (Coagulation & Liver)
--- 策略: 48小时窗口回溯 (LOCF)，基于 MIMIC-IV 数据分布特征优化
--- =================================================================
-
 -- -----------------------------------------------------------------
 -- 2.12 凝血系统 (Coagulation)
+
 -- -----------------------------------------------------------------
 DROP TABLE IF EXISTS mimiciv_derived.sofa2_stage1_coag;
 CREATE UNLOGGED TABLE mimiciv_derived.sofa2_stage1_coag AS

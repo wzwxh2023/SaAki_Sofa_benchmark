@@ -186,27 +186,45 @@ liver_sofa AS (
         ON co.stay_id = liv.stay_id AND co.hr = liv.hr
 ),
 
--- 6. Kidney (Fix: 别名一致性)
+-- 6. Kidney (Fix: 别名一致性 + 时间窗口修复)
 kidney_sofa AS (
-    SELECT 
-        co.stay_id, 
+    SELECT
+        co.stay_id,
         co.hr,
+        l.creatinine,
+        l.potassium,
+        l.ph,
+        l.bicarbonate,
+        r.on_rrt,
+        u.weight,
+        u.uo_sum_6h,
+        u.uo_sum_12h,
+        u.uo_sum_24h,
+        u.cnt_6h,
+        u.cnt_12h,
+        u.cnt_24h,
+        u.urine_rate_ml_kg_h,        -- **新增：修复后的尿量速率**
+        u.time_window_status,        -- **新增：时间窗口状态**
         CASE
-            -- Score 4
+            -- Score 4: RRT或Virtual RRT（需要足够数据进行评估）
             WHEN r.on_rrt = 1 THEN 4
-            -- Virtual RRT: (Cr>1.2 or Oliguria) AND (High K or Acidosis)
-            WHEN (l.creatinine > 1.2 OR (u.uo_sum_6h / u.weight / NULLIF(u.cnt_6h, 0)) < 0.3)
-                 AND (l.potassium >= 6.0 OR (l.ph <= 7.2 AND l.bicarbonate <= 12)) THEN 4
-            -- Score 3
+            WHEN (l.creatinine > 1.2 OR u.urine_rate_ml_kg_h < 0.3)
+                 AND (l.potassium >= 6.0 OR (l.ph <= 7.2 AND l.bicarbonate <= 12))
+                 AND u.time_window_status IN ('full_24h', 'full_12h', 'full_6h') THEN 4
+
+            -- Score 3: 严重肾功能不全
             WHEN l.creatinine > 3.5 THEN 3
-            WHEN (u.uo_sum_24h / u.weight / NULLIF(u.cnt_24h, 0)) < 0.3 THEN 3
+            WHEN u.urine_rate_ml_kg_h < 0.3 AND u.time_window_status IN ('full_24h', 'full_12h') THEN 3
             WHEN u.uo_sum_12h < 5.0 AND u.cnt_12h >= 12 THEN 3
-            -- Score 2
+
+            -- Score 2: 中度肾功能不全
             WHEN l.creatinine > 2.0 THEN 2
-            WHEN (u.uo_sum_12h / u.weight / NULLIF(u.cnt_12h, 0)) < 0.5 THEN 2
-            -- Score 1
+            WHEN u.urine_rate_ml_kg_h < 0.5 AND u.time_window_status IN ('full_12h', 'full_6h') THEN 2
+
+            -- Score 1: 轻度肾功能不全
             WHEN l.creatinine > 1.2 THEN 1
-            WHEN (u.uo_sum_6h / u.weight / NULLIF(u.cnt_6h, 0)) < 0.5 THEN 1
+            WHEN u.urine_rate_ml_kg_h < 0.5 AND u.time_window_status = 'full_6h' THEN 1
+
             ELSE 0
         END AS kidney_score
     FROM co
