@@ -3,7 +3,7 @@
 -- 参考origin_sofa_sql/sepsis3.sql，使用sofa2_scores表替代原始sofa表
 -- 脓毒症定义：可疑感染 + SOFA2评分 >= 2
 -- =================================================================
-
+DROP TABLE IF EXISTS mimiciv_derived.sepsis3_sofa2_onset CASCADE;
 -- 创建表
 CREATE TABLE mimiciv_derived.sepsis3_sofa2_onset AS
 WITH sofa2 AS (
