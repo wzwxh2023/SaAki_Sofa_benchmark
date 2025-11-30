@@ -92,63 +92,124 @@ icu_readmit AS (
     FROM mimiciv_icu.icustays
 ),
 
--- 机械通气结局（四分类系统，分开计算时长）
-ventilation_info AS (
+-- 机械通气结局（四分类系统，去重重叠时长）
+vent_base AS (
     SELECT
         v.stay_id,
-        -- 四分类呼吸支持
-        MAX(CASE WHEN v.ventilation_status = 'InvasiveVent' THEN 1 ELSE 0 END) AS invasive_vent,
-        MAX(CASE WHEN v.ventilation_status = 'Tracheostomy' THEN 1 ELSE 0 END) AS tracheostomy,
-        MAX(CASE WHEN v.ventilation_status = 'NonInvasiveVent' THEN 1 ELSE 0 END) AS noninvasive_vent,
-        MAX(CASE WHEN v.ventilation_status = 'HFNC' THEN 1 ELSE 0 END) AS hfnc,
-        MAX(CASE WHEN v.ventilation_status IN ('SupplementalOxygen', 'None') THEN 1 ELSE 0 END) AS oxygen_only,
-
-        -- 各类通气时长计算（小时）
-        -- 有创通气时长（InvasiveVent + Tracheostomy）
-        SUM(GREATEST(0, EXTRACT(EPOCH FROM (
-            CASE WHEN v.ventilation_status IN ('InvasiveVent', 'Tracheostomy')
-                 THEN LEAST(v.endtime, icu.outtime) - GREATEST(v.starttime, icu.intime) ELSE INTERVAL '0' END
-        ))/3600)) AS invasive_ventilation_hours,
-
-        -- 无创通气时长
-        SUM(GREATEST(0, EXTRACT(EPOCH FROM (
-            CASE WHEN v.ventilation_status = 'NonInvasiveVent'
-                 THEN LEAST(v.endtime, icu.outtime) - GREATEST(v.starttime, icu.intime) ELSE INTERVAL '0' END
-        ))/3600)) AS noninvasive_ventilation_hours,
-
-        -- HFNC时长
-        SUM(GREATEST(0, EXTRACT(EPOCH FROM (
-            CASE WHEN v.ventilation_status = 'HFNC'
-                 THEN LEAST(v.endtime, icu.outtime) - GREATEST(v.starttime, icu.intime) ELSE INTERVAL '0' END
-        ))/3600)) AS hfnc_hours,
-
-        -- 高级呼吸支持总时长（InvasiveVent + NonInvasiveVent + HFNC + Tracheostomy）
-        SUM(GREATEST(0, EXTRACT(EPOCH FROM (
-            CASE WHEN v.ventilation_status IN ('InvasiveVent', 'NonInvasiveVent', 'HFNC', 'Tracheostomy')
-                 THEN LEAST(v.endtime, icu.outtime) - GREATEST(v.starttime, icu.intime) ELSE INTERVAL '0' END
-        ))/3600)) AS advanced_respiratory_support_hours,
-
-        -- 从ICU入院到首次各类通气的时间（小时）
-        MIN(EXTRACT(EPOCH FROM (
-            CASE WHEN v.ventilation_status = 'InvasiveVent'
-                 THEN GREATEST(v.starttime - icu.intime, INTERVAL '0') ELSE NULL END
-        ))/3600) AS time_to_invasive_vent_hours,
-        MIN(EXTRACT(EPOCH FROM (
-            CASE WHEN v.ventilation_status = 'NonInvasiveVent'
-                 THEN GREATEST(v.starttime - icu.intime, INTERVAL '0') ELSE NULL END
-        ))/3600) AS time_to_noninvasive_vent_hours,
-        MIN(EXTRACT(EPOCH FROM (
-            CASE WHEN v.ventilation_status = 'HFNC'
-                 THEN GREATEST(v.starttime - icu.intime, INTERVAL '0') ELSE NULL END
-        ))/3600) AS time_to_hfnc_hours,
-        MIN(EXTRACT(EPOCH FROM (
-            CASE WHEN v.ventilation_status IN ('InvasiveVent', 'NonInvasiveVent', 'HFNC', 'Tracheostomy')
-                 THEN GREATEST(v.starttime - icu.intime, INTERVAL '0') ELSE NULL END
-        ))/3600) AS time_to_advanced_support_hours
-
+        v.ventilation_status,
+        GREATEST(v.starttime, icu.intime) AS starttime,
+        LEAST(v.endtime, icu.outtime) AS endtime
     FROM mimiciv_derived.ventilation v
     JOIN mimiciv_icu.icustays icu ON v.stay_id = icu.stay_id
-    GROUP BY v.stay_id, icu.intime
+    WHERE v.starttime IS NOT NULL
+      AND v.endtime IS NOT NULL
+      AND LEAST(v.endtime, icu.outtime) > GREATEST(v.starttime, icu.intime)
+),
+vent_events AS (
+    SELECT stay_id, ventilation_status, starttime AS event_time, 1 AS delta FROM vent_base
+    UNION ALL
+    SELECT stay_id, ventilation_status, endtime AS event_time, -1 AS delta FROM vent_base
+),
+vent_coverage AS (
+    SELECT
+        stay_id,
+        ventilation_status,
+        event_time,
+        SUM(delta) OVER (PARTITION BY stay_id, ventilation_status ORDER BY event_time, delta DESC) AS active_count,
+        LEAD(event_time) OVER (PARTITION BY stay_id, ventilation_status ORDER BY event_time, delta DESC) AS next_time
+    FROM vent_events
+),
+vent_durations AS (
+    -- 每个状态内部合并重叠区间后计算时长
+    SELECT
+        stay_id,
+        ventilation_status,
+        SUM(
+            CASE
+                WHEN active_count > 0 AND next_time IS NOT NULL
+                    THEN GREATEST(0, EXTRACT(EPOCH FROM (next_time - event_time)) / 3600)
+                ELSE 0
+            END
+        ) AS hours
+    FROM vent_coverage
+    GROUP BY stay_id, ventilation_status
+),
+vent_first_start AS (
+    SELECT
+        vb.stay_id,
+        MIN(CASE WHEN ventilation_status IN ('InvasiveVent', 'Tracheostomy') THEN starttime END) AS first_invasive_start,
+        MIN(CASE WHEN ventilation_status = 'NonInvasiveVent' THEN starttime END) AS first_niv_start,
+        MIN(CASE WHEN ventilation_status = 'HFNC' THEN starttime END) AS first_hfnc_start,
+        MIN(CASE WHEN ventilation_status IN ('InvasiveVent', 'NonInvasiveVent', 'HFNC', 'Tracheostomy') THEN starttime END) AS first_advanced_start
+    FROM vent_base vb
+    GROUP BY vb.stay_id
+),
+vent_advanced_union AS (
+    -- 合并高级支持（Invasive/Tracheostomy/NIV/HFNC）重叠时长，避免联用重复累计
+    SELECT
+        stay_id,
+        event_time,
+        SUM(delta) OVER (PARTITION BY stay_id ORDER BY event_time, delta DESC) AS active_count,
+        LEAD(event_time) OVER (PARTITION BY stay_id ORDER BY event_time, delta DESC) AS next_time
+    FROM (
+        SELECT stay_id, starttime AS event_time, 1 AS delta FROM vent_base WHERE ventilation_status IN ('InvasiveVent', 'Tracheostomy', 'NonInvasiveVent', 'HFNC')
+        UNION ALL
+        SELECT stay_id, endtime AS event_time, -1 AS delta FROM vent_base WHERE ventilation_status IN ('InvasiveVent', 'Tracheostomy', 'NonInvasiveVent', 'HFNC')
+    ) ev
+),
+ventilation_info AS (
+    SELECT
+        icu.stay_id,
+        -- 有无标记（按是否存在任一该类区间）
+        MAX(CASE WHEN vd.ventilation_status = 'InvasiveVent' THEN 1 ELSE 0 END) AS invasive_vent,
+        MAX(CASE WHEN vd.ventilation_status = 'Tracheostomy' THEN 1 ELSE 0 END) AS tracheostomy,
+        MAX(CASE WHEN vd.ventilation_status = 'NonInvasiveVent' THEN 1 ELSE 0 END) AS noninvasive_vent,
+        MAX(CASE WHEN vd.ventilation_status = 'HFNC' THEN 1 ELSE 0 END) AS hfnc,
+        MAX(CASE WHEN vd.ventilation_status IN ('SupplementalOxygen', 'None') THEN 1 ELSE 0 END) AS oxygen_only,
+
+        -- 去重后的各类时长（小时）
+        COALESCE(SUM(CASE WHEN vd.ventilation_status IN ('InvasiveVent', 'Tracheostomy') THEN vd.hours END), 0) AS invasive_ventilation_hours,
+        COALESCE(SUM(CASE WHEN vd.ventilation_status = 'NonInvasiveVent' THEN vd.hours END), 0) AS noninvasive_ventilation_hours,
+        COALESCE(SUM(CASE WHEN vd.ventilation_status = 'HFNC' THEN vd.hours END), 0) AS hfnc_hours,
+
+        -- 高级呼吸支持：合并多类重叠后的净时长
+        COALESCE(
+            SUM(
+                CASE
+                    WHEN adv.active_count > 0 AND adv.next_time IS NOT NULL
+                        THEN GREATEST(0, EXTRACT(EPOCH FROM (adv.next_time - adv.event_time)) / 3600)
+                    ELSE 0
+                END
+            ),
+        0) AS advanced_respiratory_support_hours,
+
+        -- 从ICU入院到首次各类通气的时间（小时）
+        MIN(
+            CASE WHEN fs.first_invasive_start IS NOT NULL
+                 THEN EXTRACT(EPOCH FROM GREATEST(fs.first_invasive_start - icu.intime, INTERVAL '0')) / 3600
+            END
+        ) AS time_to_invasive_vent_hours,
+        MIN(
+            CASE WHEN fs.first_niv_start IS NOT NULL
+                 THEN EXTRACT(EPOCH FROM GREATEST(fs.first_niv_start - icu.intime, INTERVAL '0')) / 3600
+            END
+        ) AS time_to_noninvasive_vent_hours,
+        MIN(
+            CASE WHEN fs.first_hfnc_start IS NOT NULL
+                 THEN EXTRACT(EPOCH FROM GREATEST(fs.first_hfnc_start - icu.intime, INTERVAL '0')) / 3600
+            END
+        ) AS time_to_hfnc_hours,
+        MIN(
+            CASE WHEN fs.first_advanced_start IS NOT NULL
+                 THEN EXTRACT(EPOCH FROM GREATEST(fs.first_advanced_start - icu.intime, INTERVAL '0')) / 3600
+            END
+        ) AS time_to_advanced_support_hours
+
+    FROM mimiciv_icu.icustays icu
+    LEFT JOIN vent_durations vd ON icu.stay_id = vd.stay_id
+    LEFT JOIN vent_first_start fs ON icu.stay_id = fs.stay_id
+    LEFT JOIN vent_advanced_union adv ON icu.stay_id = adv.stay_id
+    GROUP BY icu.stay_id, icu.intime
 ),
 
 -- 血管活性药物基础区间（裁剪至ICU、需有任一剂量>0）
@@ -255,7 +316,7 @@ sepsis2_info AS (
     SELECT
         stay_id,
         sepsis3_sofa2
-    FROM mimiciv_derived.sepsis3_sofa2_onset
+    FROM mimiciv_derived.sepsis3_sofa2_delta
 )
 
 -- 主查询：组合所有结局变量
@@ -322,12 +383,14 @@ SELECT
 
     -- ICU入院后28天和90天内死亡
     CASE
-        WHEN pt.dod IS NOT NULL AND pt.dod >= icu.intime
-             AND EXTRACT(EPOCH FROM (pt.dod - icu.intime))/86400 <= 28
+        WHEN COALESCE(adm.deathtime, pt.dod) IS NOT NULL
+             AND COALESCE(adm.deathtime, pt.dod) >= icu.intime
+             AND EXTRACT(EPOCH FROM (COALESCE(adm.deathtime, pt.dod) - icu.intime))/86400 <= 28
         THEN 1 ELSE 0 END AS icu_death_within_28_days,
     CASE
-        WHEN pt.dod IS NOT NULL AND pt.dod >= icu.intime
-             AND EXTRACT(EPOCH FROM (pt.dod - icu.intime))/86400 <= 90
+        WHEN COALESCE(adm.deathtime, pt.dod) IS NOT NULL
+             AND COALESCE(adm.deathtime, pt.dod) >= icu.intime
+             AND EXTRACT(EPOCH FROM (COALESCE(adm.deathtime, pt.dod) - icu.intime))/86400 <= 90
         THEN 1 ELSE 0 END AS icu_death_within_90_days,
 
     -- 死亡地点分类
