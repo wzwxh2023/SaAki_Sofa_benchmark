@@ -45,7 +45,7 @@ SELECT
     ih.stay_id, 
     ih.hr, 
     MAX(1) AS on_delirium_med
-FROM mimiciv_derived.icustay_hourly ih
+FROM mimiciv_derived.icustay_hourly_basedon_icuintime ih
 JOIN mimiciv_icu.icustays ie ON ih.stay_id = ie.stay_id
 JOIN mimiciv_hosp.prescriptions pr ON ie.hadm_id = pr.hadm_id
 WHERE (
@@ -193,7 +193,7 @@ SELECT
     ih.stay_id,
     ih.hr,
     MAX(1) AS with_resp_support
-FROM mimiciv_derived.icustay_hourly ih
+FROM mimiciv_derived.icustay_hourly_basedon_icuintime ih
 JOIN mimiciv_derived.ventilation v 
     ON ih.stay_id = v.stay_id
 WHERE
@@ -247,7 +247,7 @@ SELECT
         220125, 220128, 229254, 229262, 229255, 229263
     ) THEN 1 ELSE 0 END) AS is_other_mech
 
-FROM mimiciv_derived.icustay_hourly ih
+FROM mimiciv_derived.icustay_hourly_basedon_icuintime ih
 LEFT JOIN mimiciv_icu.chartevents ce           -- ✅ 改为 LEFT JOIN
     ON ih.stay_id = ce.stay_id
     AND ce.charttime >= ih.endtime - INTERVAL '1 HOUR' 
@@ -347,7 +347,7 @@ SELECT
     -- 3. 原始 SpO2 (用于 Step 3 过滤 <98%)
     (ARRAY_AGG(s.spo2 ORDER BY s.charttime DESC))[1] AS raw_spo2
 
-FROM mimiciv_derived.icustay_hourly ih
+FROM mimiciv_derived.icustay_hourly_basedon_icuintime ih
 LEFT JOIN pao2_all p 
     ON ih.stay_id = p.stay_id 
     AND p.charttime > ih.endtime - INTERVAL '1 HOUR' 
@@ -378,7 +378,7 @@ SELECT
     GREATEST(MAX(chem.potassium), MAX(bg.potassium)) AS potassium,
     MIN(bg.ph) AS ph,
     LEAST(MIN(chem.bicarbonate), MIN(bg.bicarbonate)) AS bicarbonate
-FROM mimiciv_derived.icustay_hourly ih
+FROM mimiciv_derived.icustay_hourly_basedon_icuintime ih
 INNER JOIN mimiciv_icu.icustays ie ON ih.stay_id = ie.stay_id
 LEFT JOIN mimiciv_derived.chemistry chem
     ON ie.subject_id = chem.subject_id
@@ -405,7 +405,7 @@ SELECT
     ih.hr,
     -- 只要 dialysis_present=1 (在周期内) 或 active=1 (正在透) 都算 RRT
     MAX(CASE WHEN rrt.dialysis_present = 1 OR rrt.dialysis_active = 1 THEN 1 ELSE 0 END) AS on_rrt
-FROM mimiciv_derived.icustay_hourly ih
+FROM mimiciv_derived.icustay_hourly_basedon_icuintime ih
 LEFT JOIN mimiciv_derived.rrt rrt 
     ON ih.stay_id = rrt.stay_id
     AND rrt.charttime >= ih.endtime - INTERVAL '1 HOUR'
@@ -479,7 +479,7 @@ uo_grid AS (
         ih.hr,
         ih.endtime,
         SUM(uo.urineoutput) AS uo_vol_hourly
-    FROM mimiciv_derived.icustay_hourly ih
+    FROM mimiciv_derived.icustay_hourly_basedon_icuintime ih
     LEFT JOIN mimiciv_derived.urine_output uo 
            ON ih.stay_id = uo.stay_id 
            AND uo.charttime > ih.endtime - INTERVAL '1 HOUR' 
@@ -548,7 +548,7 @@ SELECT
     ih.stay_id, 
     ih.hr,
     MIN(p.platelet) AS platelet_min
-FROM mimiciv_derived.icustay_hourly ih
+FROM mimiciv_derived.icustay_hourly_basedon_icuintime ih
 JOIN mimiciv_icu.icustays ie ON ih.stay_id = ie.stay_id
 LEFT JOIN plt_raw p 
     ON ie.hadm_id = p.hadm_id
@@ -578,7 +578,7 @@ SELECT
     ih.stay_id, 
     ih.hr,
     MAX(b.bilirubin_total) AS bilirubin_max
-FROM mimiciv_derived.icustay_hourly ih
+FROM mimiciv_derived.icustay_hourly_basedon_icuintime ih
 JOIN mimiciv_icu.icustays ie ON ih.stay_id = ie.stay_id
 LEFT JOIN bili_raw b 
     ON ie.hadm_id = b.hadm_id

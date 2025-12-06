@@ -10,7 +10,7 @@ DROP TABLE IF EXISTS mimiciv_derived.sofa2_hourly_raw CASCADE;
 CREATE TABLE mimiciv_derived.sofa2_hourly_raw AS
 WITH co AS (
     SELECT ih.stay_id, ie.hadm_id, ie.subject_id, hr, ih.endtime - INTERVAL '1 HOUR' AS starttime, ih.endtime
-    FROM mimiciv_derived.icustay_hourly ih
+    FROM mimiciv_derived.icustay_hourly_basedon_icuintime ih
     INNER JOIN mimiciv_icu.icustays ie ON ih.stay_id = ie.stay_id
 ),
 
