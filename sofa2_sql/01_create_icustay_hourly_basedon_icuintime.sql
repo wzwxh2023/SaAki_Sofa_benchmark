@@ -1,5 +1,5 @@
 -- =================================================================
--- 创建基于ICU入院时间的hourly表
+-- 创建基于ICU入院时间的hourly表 - 修复版
 --
 -- 功能：创建一个与官方icustay_hourly结构完全相同的表，
 --       但时间基准从第一次心率测量改为ICU入院时间
@@ -7,7 +7,7 @@
 -- 修改说明：
 -- - 基准时间：从 icustay_times.intime_hr 改为 icustays.intime
 -- - hr=0 现在对应 ICU 入院时间（向上取整到下一整点）
--- - 保持与官方完全相同的逻辑和结构
+-- - 修复：处理outtime为NULL的情况，使用最后一次Chartevents时间
 --
 -- 使用方法：
 -- 1. 运行此脚本创建新表
@@ -17,6 +17,19 @@
 -- =================================================================
 
 DROP TABLE IF EXISTS mimiciv_derived.icustay_hourly_basedon_icuintime CASCADE;
+
+-- 首先创建一个视图来获取每个ICU停留的最后记录时间
+CREATE OR REPLACE TEMP VIEW last_icu_time AS
+SELECT
+    stay_id,
+    MAX(charttime) as last_charttime
+FROM mimiciv_icu.chartevents
+WHERE stay_id IN (
+    SELECT stay_id
+    FROM mimiciv_icu.icustays
+    WHERE outtime IS NULL
+)
+GROUP BY stay_id;
 
 CREATE TABLE mimiciv_derived.icustay_hourly_basedon_icuintime AS
 /* This query generates a row for every hour the patient is in the ICU. */
@@ -38,10 +51,21 @@ WITH all_hours AS (
     /* so 0 is ICU admission time, 1 is one hour after admission, etc, */
     /* up to ICU disch */
     /*  we allow 24 hours before ICU admission (to grab labs before admit) */
-    ARRAY(SELECT
-      *
-    FROM GENERATE_SERIES(-24, CAST(CEIL(EXTRACT(EPOCH FROM (ie.outtime - ie.intime)) / 3600.0) AS INT))) AS hrs /* noqa: L016 */
+    CASE
+      WHEN ie.outtime IS NOT NULL THEN
+        ARRAY(SELECT *
+        FROM GENERATE_SERIES(-24, CAST(CEIL(EXTRACT(EPOCH FROM (ie.outtime - ie.intime)) / 3600.0) AS INT)))
+      ELSE
+        -- 对于outtime为NULL的患者，使用最后一次chartevents时间
+        -- 确保至少有24小时的数据用于first day评分
+        ARRAY(SELECT *
+        FROM GENERATE_SERIES(-24, GREATEST(
+            CAST(CEIL(EXTRACT(EPOCH FROM (COALESCE(lt.last_charttime, ie.intime + INTERVAL '7 days')) - ie.intime)) / 3600.0 AS INT),
+            24  -- 至少生成前24小时
+        )))
+    END AS hrs
   FROM mimiciv_icu.icustays ie
+  LEFT JOIN last_icu_time lt ON ie.stay_id = lt.stay_id
 )
 SELECT
   stay_id,
@@ -73,3 +97,6 @@ SELECT
     MIN(hr) as min_hr,
     MAX(hr) as max_hr
 FROM mimiciv_derived.icustay_hourly_basedon_icuintime;
+
+-- 清理临时视图
+DROP VIEW IF EXISTS last_icu_time;
