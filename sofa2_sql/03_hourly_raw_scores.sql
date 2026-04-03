@@ -38,8 +38,12 @@ resp_sofa AS (
         co.stay_id, 
         co.hr,
         CASE
-            -- ECMO（任何类型）→ 呼吸4分
-            WHEN ec.is_ecmo = 1 THEN 4
+            -- [P1a] ECMO（任何类型）→ 呼吸4分
+            -- 修正: 原代码只检查 is_ecmo，遗漏仅有 229268 记录的 629 个小时
+            WHEN ec.is_ecmo = 1
+              OR ec.is_vv_ecmo = 1
+              OR ec.is_va_ecmo = 1
+              OR ec.is_ecmo_unknown_type = 1 THEN 4
             -- PF Ratio
             WHEN ox.pf_ratio IS NOT NULL THEN
                 CASE 
@@ -108,8 +112,10 @@ cv_sofa AS (
             -- 2. VA-ECMO 或 VAV-ECMO
             WHEN COALESCE(has_va_ecmo, 0) = 1 THEN 4
             -- 3. 有ECMO但非VV（包括未知类型）→ 4分
-            WHEN COALESCE(has_ecmo, 0) = 1 
-                 AND COALESCE(has_vv_ecmo, 0) = 0 THEN 4   -- ✅ 添加 THEN 4
+            WHEN COALESCE(has_ecmo, 0) = 1
+                 AND COALESCE(has_vv_ecmo, 0) = 0 THEN 4
+            -- [P1b] 补充: 229268 记录的未知类型（仅有配置记录无其他ECMO itemid时）
+            WHEN COALESCE(has_ecmo_unknown, 0) = 1 THEN 4
             -- 4. 高剂量血管活性药
             WHEN (COALESCE(rate_nor,0) + COALESCE(rate_epi,0)) > 0.4 THEN 4
             WHEN (COALESCE(rate_nor,0) + COALESCE(rate_epi,0)) > 0.2 AND other_drug = 1 THEN 4
@@ -186,44 +192,40 @@ liver_sofa AS (
         ON co.stay_id = liv.stay_id AND co.hr = liv.hr
 ),
 
--- 6. Kidney (Fix: 别名一致性 + 时间窗口修复)
+-- 6. Kidney [P0b] 三窗口尿量 + Virtual RRT 修正 + 无尿=0mL
+-- 修正来源: PATCH_kidney_three_rate.md (2026-04-03)
+-- 改动: (1) 三窗口尿量级联判断 (2) Virtual RRT Cr路径不要求尿量窗口
+--        (3) 无尿从 <5mL 改为 =0mL (4) Score 2 在 hr>=24 不再失效
 kidney_sofa AS (
     SELECT
         co.stay_id,
         co.hr,
-        l.creatinine,
-        l.potassium,
-        l.ph,
-        l.bicarbonate,
-        r.on_rrt,
-        u.weight,
-        u.uo_sum_6h,
-        u.uo_sum_12h,
-        u.uo_sum_24h,
-        u.cnt_6h,
-        u.cnt_12h,
-        u.cnt_24h,
-        u.urine_rate_ml_kg_h,        -- **新增：修复后的尿量速率**
-        u.time_window_status,        -- **新增：时间窗口状态**
         CASE
-            -- Score 4: RRT或Virtual RRT（需要足够数据进行评估）
+            -- ========== Score 4: RRT 或 Virtual RRT ==========
             WHEN r.on_rrt = 1 THEN 4
-            WHEN (l.creatinine > 1.2 OR u.urine_rate_ml_kg_h < 0.3)
-                 AND (l.potassium >= 6.0 OR (l.ph <= 7.2 AND l.bicarbonate <= 12))
-                 AND u.time_window_status IN ('full_24h', 'full_12h', 'full_6h') THEN 4
+            -- Virtual RRT 路径1: Cr 驱动（不要求尿量窗口）
+            WHEN l.creatinine > 1.2
+                 AND (l.potassium >= 6.0 OR (l.ph <= 7.2 AND l.bicarbonate <= 12)) THEN 4
+            -- Virtual RRT 路径2: 少尿驱动
+            WHEN COALESCE(u.rate_6h, u.rate_12h, u.rate_24h) < 0.3
+                 AND (l.potassium >= 6.0 OR (l.ph <= 7.2 AND l.bicarbonate <= 12)) THEN 4
 
-            -- Score 3: 严重肾功能不全
+            -- ========== Score 3: 严重肾功能不全 ==========
             WHEN l.creatinine > 3.5 THEN 3
-            WHEN u.urine_rate_ml_kg_h < 0.3 AND u.time_window_status IN ('full_24h', 'full_12h') THEN 3
-            WHEN u.uo_sum_12h < 5.0 AND u.cnt_12h >= 12 THEN 3
+            -- 24h 窗口极少尿
+            WHEN u.rate_24h < 0.3 THEN 3
+            -- 12h 无尿（严格 0 mL，与 SOFA-2 原文一致）
+            WHEN u.uo_sum_12h = 0 AND u.cnt_12h >= 12 THEN 3
 
-            -- Score 2: 中度肾功能不全
+            -- ========== Score 2: 中度 ==========
             WHEN l.creatinine > 2.0 THEN 2
-            WHEN u.urine_rate_ml_kg_h < 0.5 AND u.time_window_status IN ('full_12h', 'full_6h') THEN 2
+            -- 12h 窗口少尿（优先查长窗口）
+            WHEN u.rate_12h < 0.5 THEN 2
 
-            -- Score 1: 轻度肾功能不全
+            -- ========== Score 1: 轻度 ==========
             WHEN l.creatinine > 1.2 THEN 1
-            WHEN u.urine_rate_ml_kg_h < 0.5 AND u.time_window_status = 'full_6h' THEN 1
+            -- 6h 窗口少尿（短窗口兜底：刚来的或近期恶化的）
+            WHEN u.rate_6h < 0.5 THEN 1
 
             ELSE 0
         END AS kidney_score

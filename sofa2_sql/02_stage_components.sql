@@ -381,12 +381,12 @@ SELECT
 FROM mimiciv_derived.icustay_hourly_basedon_icuintime ih
 INNER JOIN mimiciv_icu.icustays ie ON ih.stay_id = ie.stay_id
 LEFT JOIN mimiciv_derived.chemistry chem
-    ON ie.subject_id = chem.subject_id
-    AND chem.charttime > ih.endtime - INTERVAL '1 HOUR'   -- ✅ 改为1小时
+    ON ie.hadm_id = chem.hadm_id                          -- [P2] subject_id → hadm_id，限制在当前住院
+    AND chem.charttime > ih.endtime - INTERVAL '1 HOUR'
     AND chem.charttime <= ih.endtime
 LEFT JOIN mimiciv_derived.bg bg
-    ON ie.subject_id = bg.subject_id
-    AND bg.charttime > ih.endtime - INTERVAL '1 HOUR'     -- ✅ 改为1小时
+    ON ie.hadm_id = bg.hadm_id                            -- [P2] subject_id → hadm_id，限制在当前住院
+    AND bg.charttime > ih.endtime - INTERVAL '1 HOUR'
     AND bg.charttime <= ih.endtime
 WHERE ih.hr >= -24
 GROUP BY ih.stay_id, ih.hr;
@@ -502,25 +502,19 @@ SELECT
     COUNT(*) OVER w12 AS cnt_12h,
     COUNT(*) OVER w24 AS cnt_24h,
 
-    -- **修复：根据实际可用时间计算尿量速率**
-    CASE
-        WHEN g.hr >= 0 AND w.weight > 0 THEN
-            CASE
-                WHEN g.hr >= 24 THEN SUM(uo_vol_hourly) OVER w24 / w.weight / 24  -- 有完整24小时数据
-                WHEN g.hr >= 12 THEN SUM(uo_vol_hourly) OVER w12 / w.weight / 12  -- 有12小时数据
-                WHEN g.hr >= 6 THEN SUM(uo_vol_hourly) OVER w6 / w.weight / 6    -- 有6小时数据
-                ELSE NULL  -- 前6小时数据不足，不评估尿量速率
-            END
-        ELSE NULL
-    END AS urine_rate_ml_kg_h,
+    -- 三窗口尿量速率 (ml/kg/h): 同时输出，评分时级联判断
+    -- [P0a] 修正: 原 urine_rate_ml_kg_h 只存最长窗口，长期患者近期少尿被稀释
+    CASE WHEN g.hr >= 6  AND w.weight > 0
+         THEN SUM(uo_vol_hourly) OVER w6  / w.weight / 6
+    END AS rate_6h,
 
-    -- **标记数据是否足够进行评分**
-    CASE
-        WHEN g.hr >= 24 THEN 'full_24h'
-        WHEN g.hr >= 12 THEN 'full_12h'
-        WHEN g.hr >= 6 THEN 'full_6h'
-        ELSE 'insufficient'
-    END AS time_window_status
+    CASE WHEN g.hr >= 12 AND w.weight > 0
+         THEN SUM(uo_vol_hourly) OVER w12 / w.weight / 12
+    END AS rate_12h,
+
+    CASE WHEN g.hr >= 24 AND w.weight > 0
+         THEN SUM(uo_vol_hourly) OVER w24 / w.weight / 24
+    END AS rate_24h
 
 FROM uo_grid g
 JOIN weight_final w ON g.stay_id = w.stay_id
