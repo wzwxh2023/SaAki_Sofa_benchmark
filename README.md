@@ -8,7 +8,7 @@ Open-source SOFA-2 implementation and benchmark on **MIMIC-IV v3.1** for ICU sep
 
 ## Background
 
-SOFA-2 is the second-generation Sequential Organ Failure Assessment score proposed by Vincent et al. (Lancet, 2023), refining the original SOFA (1996) with:
+SOFA-2 is the second-generation Sequential Organ Failure Assessment score (proposed in *The Lancet*, 2023), refining the original SOFA (1996) with:
 
 - Three-window urine output rate for kidney scoring (6h / 12h / 24h)
 - Virtual RRT Cr pathway (does not require urine)
@@ -27,7 +27,7 @@ This repository provides:
 
 ## Publications
 
-- **Letter**: Bai et al. *Journal of Intensive Care*. 2026;14:32. (All-ICU cohort, N = 65,366)
+- **Letter** (all-ICU cohort, N = 65,366): *Journal of Intensive Care*. 2026;14:32. Full citation on the journal page.
 - **Main article** (under revision at *Clinical Medicine*): Sepsis cohort, N = 30,667 post-patch; modeling cohort N = 29,246 (train/validation 20,597 / 8,649 by admission year 2168)
 
 ---
@@ -107,9 +107,11 @@ After running `02_stage_components.sql`, the `sofa2_stage1_urine` intermediate t
 
 ## Citing
 
-If you use this code, please cite:
+If you use this code, please cite the letter:
 
-> Bai et al. Evaluating SOFA-2 using the MIMIC-IV database. *Journal of Intensive Care*. 2026;14:32.
+> *Journal of Intensive Care*. 2026;14:32 (full citation available on the journal landing page).
+
+An expanded methodology article (sepsis cohort) is currently under revision.
 
 ---
 
