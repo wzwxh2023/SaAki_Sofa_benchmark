@@ -123,7 +123,7 @@ MIT — see [LICENSE](LICENSE).
 
 ## 中文摘要
 
-本仓库提供在 MIMIC-IV v3.1 上实现 **SOFA-2**（Lancet 2023 提出的新版评分）的完整 PostgreSQL 管线，以及与 SOFA-1 在 ICU 脓毒症死亡率预测上的基准对比。**据我们所知，这是目前公开的第一份 SOFA-2 × MIMIC-IV SQL 实现**。
+本仓库提供在 MIMIC-IV v3.1 上实现 **SOFA-2**（JAMA  2025 提出的新版评分）的完整 PostgreSQL 管线，以及与 SOFA-1 在 ICU 脓毒症死亡率预测上的基准对比。**据我们所知，这是目前公开的第一份 SOFA-2 × MIMIC-IV SQL 实现**。
 
 主要结论：SOFA-2 在 ICU 和院内死亡率预测上**一致但幅度有限地优于** SOFA-1（AUC 差异 0.02 左右；NRI = 0.143）。代价是计算复杂度上升（需要小时级 vasoactive 数据、三窗口尿量、ECMO/机械支持识别等）。
 
