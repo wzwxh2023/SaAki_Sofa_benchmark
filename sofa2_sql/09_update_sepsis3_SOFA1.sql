@@ -41,14 +41,14 @@ sofa AS (
         stay_id,
         starttime,
         endtime,
-        respiration_24hours AS respiration,
-        coagulation_24hours AS coagulation,
-        liver_24hours AS liver,
-        cardiovascular_24hours AS cardiovascular,
-        cns_24hours AS cns,
-        renal_24hours AS renal,
-        sofa_24hours AS sofa_score
-    FROM mimiciv_derived.sofa
+        sofa_respiration_official_mimic_hourly AS respiration,
+        sofa_coagulation_official_mimic_hourly AS coagulation,
+        sofa_liver_official_mimic_hourly AS liver,
+        sofa_cardiovascular_official_mimic_hourly AS cardiovascular,
+        sofa_cns_official_mimic_hourly AS cns,
+        sofa_renal_official_mimic_hourly AS renal,
+        "SOFA" AS sofa_score
+    FROM mimiciv_derived.sofa1_hourly_current
 ),
 baseline AS (
     -- 基线 SOFA：疑似感染时间前 48 小时内的最小 SOFA

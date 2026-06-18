@@ -56,14 +56,14 @@ patient_info AS (
 sofa_info AS (
     SELECT
         stay_id,
-        sofa,
-        respiration,
-        coagulation,
-        liver,
-        cardiovascular,
-        cns,
-        renal
-    FROM mimiciv_derived.first_day_sofa
+        "SOFA" AS sofa,
+        sofa_respiration_official_mimic AS respiration,
+        sofa_coagulation_official_mimic AS coagulation,
+        sofa_liver_official_mimic AS liver,
+        sofa_cardiovascular_official_mimic AS cardiovascular,
+        sofa_cns_official_mimic AS cns,
+        sofa_renal_official_mimic AS renal
+    FROM mimiciv_derived.sofa_first_day_current
 ),
 
 -- SOFA2评分
@@ -470,15 +470,15 @@ LEFT JOIN vasoactive_info vaso ON icu.stay_id = vaso.stay_id
 LEFT JOIN rrt_info rrt ON icu.stay_id = rrt.stay_id
 LEFT JOIN icu_readmit icu_r ON icu.stay_id = icu_r.stay_id;
 
--- 创建索引
-CREATE INDEX idx_patient_outcomes_subject ON mimiciv_derived.patient_outcomes(subject_id);
-CREATE INDEX idx_patient_outcomes_stay ON mimiciv_derived.patient_outcomes(stay_id);
-CREATE INDEX idx_patient_outcomes_hadm ON mimiciv_derived.patient_outcomes(hadm_id);
-CREATE INDEX idx_patient_outcomes_mortality ON mimiciv_derived.patient_outcomes(hospital_mortality);
-CREATE INDEX idx_patient_outcomes_icu_mortality ON mimiciv_derived.patient_outcomes(icu_mortality);
-CREATE INDEX idx_patient_outcomes_sepsis ON mimiciv_derived.patient_outcomes(sepsis3_sofa2);
-CREATE INDEX idx_patient_outcomes_invasive_vent ON mimiciv_derived.patient_outcomes(invasive_ventilation);
-CREATE INDEX idx_patient_outcomes_rrt ON mimiciv_derived.patient_outcomes(rrt_required);
+-- 创建索引（使用当前版本命名，避免与历史 pre_patch 表索引冲突）
+CREATE INDEX idx_patient_outcomes_current_subject ON mimiciv_derived.patient_outcomes(subject_id);
+CREATE INDEX idx_patient_outcomes_current_stay ON mimiciv_derived.patient_outcomes(stay_id);
+CREATE INDEX idx_patient_outcomes_current_hadm ON mimiciv_derived.patient_outcomes(hadm_id);
+CREATE INDEX idx_patient_outcomes_current_mortality ON mimiciv_derived.patient_outcomes(hospital_mortality);
+CREATE INDEX idx_patient_outcomes_current_icu_mortality ON mimiciv_derived.patient_outcomes(icu_mortality);
+CREATE INDEX idx_patient_outcomes_current_sepsis ON mimiciv_derived.patient_outcomes(sepsis3_sofa2);
+CREATE INDEX idx_patient_outcomes_current_invasive_vent ON mimiciv_derived.patient_outcomes(invasive_ventilation);
+CREATE INDEX idx_patient_outcomes_current_rrt ON mimiciv_derived.patient_outcomes(rrt_required);
 
 -- 添加表注释
 COMMENT ON TABLE mimiciv_derived.patient_outcomes IS 'Comprehensive patient outcomes including SOFA/SOFA2 scores, mortality, ventilation (4-category), RRT, and survival times';
