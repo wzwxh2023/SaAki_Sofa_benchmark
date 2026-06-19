@@ -106,18 +106,22 @@ For platelet and bilirubin, the SQL stages both strict current-hour evidence and
 
 ### Sepsis definition governance
 
-The primary sepsis cohort policy is explicit:
+This repository exposes explicit Sepsis-3 cohort flags rather than enforcing one
+universal cohort definition. Downstream studies should choose the definition
+that matches the research question, for example a SOFA-1 delta-defined cohort, a
+SOFA-2 delta-defined cohort, the official MIMIC comparator, or a union cohort.
+
+The delta-union flag is retained as one available option:
 
 ```text
 sepsis3_primary_delta_any = sepsis3_sofa1_delta OR sepsis3_sofa2_delta
 ```
 
 `mimiciv_derived.sepsis3` is retained as the official MIMIC comparator
-(`sepsis3_sofa1_official_absolute`: SOFA-1 >= 2 with baseline assumed 0), but
-it is not the primary cohort flag. `09_extract_outcomes_final_corrected.sql`
-first materializes `mimiciv_derived.sepsis3_definitions_current` and then
-exports the same definitions into `mimiciv_derived.patient_outcomes` with
-explicit names:
+(`sepsis3_sofa1_official_absolute`: SOFA-1 >= 2 with baseline assumed 0).
+`09_extract_outcomes_final_corrected.sql` first materializes
+`mimiciv_derived.sepsis3_definitions_current` and then exports the same
+definitions into `mimiciv_derived.patient_outcomes` with explicit names:
 
 - `sepsis3_sofa1_official_absolute`
 - `sepsis3_sofa1_delta`
@@ -156,6 +160,4 @@ MIT — see [LICENSE](LICENSE).
 
 本仓库提供在 MIMIC-IV v3.1 上实现 **SOFA-2**（JAMA 2025 提出的新版评分）的完整 PostgreSQL 管线。**据我们所知，这是目前公开的第一份 SOFA-2 × MIMIC-IV SQL 实现**。
 
-本仓库定位为可复用的评分构建基础工程，不承载某一篇文章的具体 cohort 数字、建模样本量或统计结果。文章级流程图和模型结果应在对应分析项目或手稿中单独维护。
-
-代码包含 SOFA-2 组件构建、版本治理、历史实现归档和敏感性分析 SQL，可供后续研究者复现或审查评分实现。
+本仓库定位为可复用的评分构建基础工程，代码包含 SOFA-2 组件构建、版本治理、历史实现归档和敏感性分析 SQL，可供后续研究者复现或审查评分实现。
