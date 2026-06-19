@@ -27,7 +27,7 @@ the wording of the SOFA-2 publication:
 
 This repository provides:
 
-1. A reproducible **PostgreSQL pipeline** that computes SOFA-2 (and SOFA-1 for reference) on MIMIC-IV v3.1
+1. A reproducible **PostgreSQL pipeline** that computes SOFA-2 on MIMIC-IV v3.1 and can join an explicit SOFA-1 reference layer for cohort/outcome exports
 2. **Audit and sensitivity SQL** documenting implementation decisions and alternative score policies
 3. A documented **current governed SOFA-2 policy**: platelet/bilirubin `lab48_rescue` plus kidney scoring from the official MIMIC `urine_output_rate` derived table
 
@@ -90,6 +90,18 @@ bash run_steps.sh
 
 No credentials in scripts — `psql` auto-authenticates via `~/.pgpass`.
 
+Steps `00`-`07` build the SOFA-2 hourly, first-day, and SOFA-2 delta
+artifacts from MIMIC-IV derived tables. Steps `08`-`09` additionally require a
+local SOFA-1 governance layer:
+
+- `mimiciv_derived.sofa1_hourly_current`
+- `mimiciv_derived.sofa_first_day_current`
+
+In the current governed database used by this project, those views expose the
+official MIMIC SOFA-1 implementation. If these views are absent, install or
+create the SOFA-1 reference layer before running the cohort/outcome export
+steps.
+
 ### Current SOFA-2 implementation
 
 The current primary SQL policy is `lab48_rescue_kidney_uorate`.
@@ -111,7 +123,10 @@ universal cohort definition. Downstream studies should choose the definition
 that matches the research question, for example a SOFA-1 delta-defined cohort, a
 SOFA-2 delta-defined cohort, the official MIMIC comparator, or a union cohort.
 
-The delta-union flag is retained as one available option:
+The delta-union flag is retained as one available option. The column name
+contains `primary` for backward compatibility with earlier local analyses; it
+should be read as a selectable union cohort flag, not as a universal default
+for every downstream study.
 
 ```text
 sepsis3_primary_delta_any = sepsis3_sofa1_delta OR sepsis3_sofa2_delta
@@ -128,6 +143,13 @@ definitions into `mimiciv_derived.patient_outcomes` with explicit names:
 - `sepsis3_sofa2_delta`
 - `sepsis3_primary_delta_any`
 - `sepsis3_primary_policy`
+
+Current MIMIC-IV score-source policy:
+
+| Score layer | Current source/policy | Notes |
+| --- | --- | --- |
+| SOFA-1 | official MIMIC implementation exposed through the local SOFA-1 current views | Used as comparator and for SOFA-1 delta cohorts |
+| SOFA-2 | local SOFA-2 SQL with platelet/bilirubin `lab48_rescue` and kidney `urine_output_rate` | Main SOFA-2 implementation in this repository |
 
 ---
 

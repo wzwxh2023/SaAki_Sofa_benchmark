@@ -7,6 +7,9 @@
 -- Build the current governed sepsis definition table before outcomes.
 -- One row per ICU stay; downstream analyses should use explicit flags instead
 -- of ambiguous legacy sepsis labels.
+-- The sepsis3_primary_delta_any column name is retained for backward
+-- compatibility. Treat it as a selectable SOFA-1/SOFA-2 delta-union option,
+-- not as a universal default cohort for all downstream studies.
 DROP TABLE IF EXISTS mimiciv_derived.sepsis3_definitions_current CASCADE;
 
 CREATE TABLE mimiciv_derived.sepsis3_definitions_current AS
@@ -36,11 +39,12 @@ CREATE INDEX idx_sepsis3_definitions_current_stay ON mimiciv_derived.sepsis3_def
 CREATE INDEX idx_sepsis3_definitions_current_subject ON mimiciv_derived.sepsis3_definitions_current(subject_id);
 CREATE INDEX idx_sepsis3_definitions_current_primary ON mimiciv_derived.sepsis3_definitions_current(sepsis3_primary_delta_any);
 
-COMMENT ON TABLE mimiciv_derived.sepsis3_definitions_current IS 'Current governed sepsis definitions: official SOFA-1 absolute comparator, SOFA-1 delta, SOFA-2 delta, and primary delta-any policy';
+COMMENT ON TABLE mimiciv_derived.sepsis3_definitions_current IS 'Current governed sepsis definition flags: official SOFA-1 absolute comparator, SOFA-1 delta, SOFA-2 delta, and selectable delta-union option';
 COMMENT ON COLUMN mimiciv_derived.sepsis3_definitions_current.sepsis3_sofa1_official_absolute IS 'Official MIMIC sepsis3 definition: SOFA-1 >= 2 with baseline assumed 0';
 COMMENT ON COLUMN mimiciv_derived.sepsis3_definitions_current.sepsis3_sofa1_delta IS 'SOFA-1 explicit delta definition: SOFA-1 change >= 2 from pre-infection baseline';
 COMMENT ON COLUMN mimiciv_derived.sepsis3_definitions_current.sepsis3_sofa2_delta IS 'SOFA-2 explicit delta definition: SOFA-2 change >= 2 from pre-infection baseline';
-COMMENT ON COLUMN mimiciv_derived.sepsis3_definitions_current.sepsis3_primary_delta_any IS 'Primary benchmark cohort flag: sepsis3_sofa1_delta OR sepsis3_sofa2_delta';
+COMMENT ON COLUMN mimiciv_derived.sepsis3_definitions_current.sepsis3_primary_delta_any IS 'Selectable delta-union cohort flag retained under legacy name: sepsis3_sofa1_delta OR sepsis3_sofa2_delta';
+COMMENT ON COLUMN mimiciv_derived.sepsis3_definitions_current.sepsis3_primary_policy IS 'Policy label for the selectable delta-union cohort flag; not a universal default for all studies';
 
 -- 删除已存在的表
 DROP TABLE IF EXISTS mimiciv_derived.patient_outcomes CASCADE;
@@ -90,7 +94,21 @@ patient_info AS (
     FROM mimiciv_hosp.patients
 ),
 
--- SOFA评分
+-- Governed survival endpoints: downstream analysis should use these fields
+-- rather than recomputing survival from raw admissions/patients timestamps.
+survival_outcomes AS (
+    SELECT
+        stay_id,
+        event_status,
+        survival_days,
+        os_28d_status,
+        os_90d_status,
+        os_1yr_status,
+        qa_any_flag
+    FROM mimiciv_team.survival_outcomes
+),
+
+-- SOFA评分：requires local SOFA-1 current view exposing the official MIMIC implementation
 sofa_info AS (
     SELECT
         stay_id,
@@ -104,14 +122,16 @@ sofa_info AS (
     FROM mimiciv_derived.sofa_first_day_current
 ),
 
--- SOFA2评分
+-- SOFA2评分：direct pipeline reads the just-built first_day_sofa2 table.
+-- Shadow rebuilds must bind this source to the shadow first-day artifact before
+-- exporting patient_outcomes.
 sofa2_info AS (
     SELECT
         stay_id,
-        sofa2_total,
+        sofa2_total_lab48_rescue AS sofa2_total,
         respiratory,
-        hemostasis,
-        liver,
+        hemostasis_lab48_rescue AS hemostasis,
+        liver_lab48_rescue AS liver,
         cardiovascular,
         brain,
         kidney
@@ -392,44 +412,18 @@ SELECT
               AND adm.deathtime BETWEEN icu.intime AND COALESCE(icu.outtime, adm.deathtime)
          THEN 1 ELSE 0 END AS icu_mortality,
 
-    -- 生存分析字段（确保日粒度一致，避免Timestamp/Date混减误差）
-    CASE
-        WHEN adm.deathtime IS NOT NULL OR pt.dod IS NOT NULL THEN 1
-        ELSE 0
-    END AS event_status,
-    -- 从ICU入科到结局（死亡优先deathtime，其次dod；存活取出院），按日期差计算并截断为非负
-    GREATEST(
-        0,
-        (
-            COALESCE(adm.deathtime::date, pt.dod::date, adm.dischtime::date)
-            - icu.intime::date
-        )::float
-    ) AS survival_days,
-    -- 死亡且在入科后365天内的标记（0/1）
-    CASE
-        WHEN (adm.deathtime IS NOT NULL OR pt.dod IS NOT NULL)
-             AND (
-                 COALESCE(adm.deathtime::date, pt.dod::date) - icu.intime::date
-             ) >= 0
-             AND (
-                 COALESCE(adm.deathtime::date, pt.dod::date) - icu.intime::date
-             ) <= 365
-        THEN 1 ELSE 0 END AS mortality_1yr,
+    -- 生存分析字段来自 mimiciv_team.survival_outcomes authoritative table。
+    so.event_status,
+    so.survival_days,
+    so.qa_any_flag AS survival_qa_any_flag,
+    so.os_1yr_status AS mortality_1yr,
 
     -- ICU入院前住院天数
     GREATEST(0, EXTRACT(EPOCH FROM (icu.intime - adm.admittime))/86400) AS pre_icu_hospital_days,
 
     -- ICU入院后28天和90天内死亡
-    CASE
-        WHEN COALESCE(adm.deathtime, pt.dod) IS NOT NULL
-             AND COALESCE(adm.deathtime, pt.dod) >= icu.intime
-             AND EXTRACT(EPOCH FROM (COALESCE(adm.deathtime, pt.dod) - icu.intime))/86400 <= 28
-        THEN 1 ELSE 0 END AS icu_death_within_28_days,
-    CASE
-        WHEN COALESCE(adm.deathtime, pt.dod) IS NOT NULL
-             AND COALESCE(adm.deathtime, pt.dod) >= icu.intime
-             AND EXTRACT(EPOCH FROM (COALESCE(adm.deathtime, pt.dod) - icu.intime))/86400 <= 90
-        THEN 1 ELSE 0 END AS icu_death_within_90_days,
+    so.os_28d_status AS icu_death_within_28_days,
+    so.os_90d_status AS icu_death_within_90_days,
 
     -- 死亡地点分类
     CASE
@@ -506,6 +500,7 @@ SELECT
 FROM icu_info icu
 LEFT JOIN hosp_info adm ON icu.hadm_id = adm.hadm_id
 LEFT JOIN patient_info pt ON icu.subject_id = pt.subject_id
+LEFT JOIN survival_outcomes so ON icu.stay_id = so.stay_id
 LEFT JOIN sofa_info sofa ON icu.stay_id = sofa.stay_id
 LEFT JOIN sofa2_info sofa2 ON icu.stay_id = sofa2.stay_id
 LEFT JOIN sepsis_definitions sep ON icu.stay_id = sep.stay_id
@@ -529,7 +524,8 @@ COMMENT ON TABLE mimiciv_derived.patient_outcomes IS 'Comprehensive patient outc
 COMMENT ON COLUMN mimiciv_derived.patient_outcomes.sepsis3_sofa1_official_absolute IS 'Official MIMIC sepsis3 definition: SOFA-1 >= 2 with baseline assumed 0';
 COMMENT ON COLUMN mimiciv_derived.patient_outcomes.sepsis3_sofa1_delta IS 'SOFA-1 explicit delta definition: SOFA-1 change >= 2 from pre-infection baseline';
 COMMENT ON COLUMN mimiciv_derived.patient_outcomes.sepsis3_sofa2_delta IS 'SOFA-2 explicit delta definition: SOFA-2 change >= 2 from pre-infection baseline';
-COMMENT ON COLUMN mimiciv_derived.patient_outcomes.sepsis3_primary_delta_any IS 'Primary benchmark cohort flag: sepsis3_sofa1_delta OR sepsis3_sofa2_delta';
+COMMENT ON COLUMN mimiciv_derived.patient_outcomes.sepsis3_primary_delta_any IS 'Selectable delta-union cohort flag retained under legacy name: sepsis3_sofa1_delta OR sepsis3_sofa2_delta';
+COMMENT ON COLUMN mimiciv_derived.patient_outcomes.sepsis3_primary_policy IS 'Policy label for the selectable delta-union cohort flag; not a universal default for all studies';
 
 -- 数据验证查询
 -- SELECT

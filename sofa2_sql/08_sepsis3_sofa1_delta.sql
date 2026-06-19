@@ -36,7 +36,7 @@ WITH soi AS (
     WHERE stay_id IS NOT NULL
 ),
 sofa AS (
-    -- 使用原始 SOFA 评分表
+    -- 使用本地 SOFA-1 current view；该 view 应暴露 official MIMIC SOFA-1 hourly implementation
     SELECT
         stay_id,
         starttime,

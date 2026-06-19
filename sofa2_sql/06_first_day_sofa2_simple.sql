@@ -8,6 +8,7 @@ DROP TABLE IF EXISTS mimiciv_derived.first_day_sofa2 CASCADE;
 
 -- 创建表
 CREATE TABLE mimiciv_derived.first_day_sofa2 AS
+WITH organ_max AS (
 SELECT
     stay_id,
     subject_id,
@@ -19,11 +20,6 @@ SELECT
     MAX(liver) AS liver,
     MAX(kidney) AS kidney,
     MAX(hemostasis) AS hemostasis,
-    -- 取0-23小时内的最高总分
-    MAX(sofa2_total) AS sofa2_total,
-    MAX(sofa2_total_lab48_rescue) AS sofa2_total_lab48_rescue,
-    MAX(sofa2_total_strict24) AS sofa2_total_strict24,
-    MAX(sofa2_total_full48_exploratory) AS sofa2_total_full48_exploratory,
     MAX(liver_lab48_rescue) AS liver_lab48_rescue,
     MAX(liver_strict24) AS liver_strict24,
     MAX(liver_full48_exploratory) AS liver_full48_exploratory,
@@ -34,7 +30,40 @@ SELECT
     BOOL_OR(bilirubin_lab48_rescue_used) AS bilirubin_lab48_rescue_used
 FROM mimiciv_derived.sofa2_scores_hr_filtered
 WHERE hr BETWEEN 0 AND 23  -- ICU入院后24小时（0-23小时）
-GROUP BY stay_id, subject_id, hadm_id;
+GROUP BY stay_id, subject_id, hadm_id
+)
+SELECT
+    stay_id,
+    subject_id,
+    hadm_id,
+    brain,
+    respiratory,
+    cardiovascular,
+    liver,
+    kidney,
+    hemostasis,
+    -- First-day SOFA totals are SUM(per-organ first-day maxima), not MAX(hourly total).
+    COALESCE(brain, 0) + COALESCE(respiratory, 0)
+        + COALESCE(cardiovascular, 0) + COALESCE(kidney, 0)
+        + COALESCE(liver_lab48_rescue, 0) + COALESCE(hemostasis_lab48_rescue, 0) AS sofa2_total,
+    COALESCE(brain, 0) + COALESCE(respiratory, 0)
+        + COALESCE(cardiovascular, 0) + COALESCE(kidney, 0)
+        + COALESCE(liver_lab48_rescue, 0) + COALESCE(hemostasis_lab48_rescue, 0) AS sofa2_total_lab48_rescue,
+    COALESCE(brain, 0) + COALESCE(respiratory, 0)
+        + COALESCE(cardiovascular, 0) + COALESCE(kidney, 0)
+        + COALESCE(liver_strict24, 0) + COALESCE(hemostasis_strict24, 0) AS sofa2_total_strict24,
+    COALESCE(brain, 0) + COALESCE(respiratory, 0)
+        + COALESCE(cardiovascular, 0) + COALESCE(kidney, 0)
+        + COALESCE(liver_full48_exploratory, 0) + COALESCE(hemostasis_full48_exploratory, 0) AS sofa2_total_full48_exploratory,
+    liver_lab48_rescue,
+    liver_strict24,
+    liver_full48_exploratory,
+    hemostasis_lab48_rescue,
+    hemostasis_strict24,
+    hemostasis_full48_exploratory,
+    platelet_lab48_rescue_used,
+    bilirubin_lab48_rescue_used
+FROM organ_max;
 
 -- 创建索引
 CREATE INDEX idx_first_day_sofa2_stay ON mimiciv_derived.first_day_sofa2(stay_id);
@@ -51,7 +80,7 @@ COMMENT ON COLUMN mimiciv_derived.first_day_sofa2.liver IS 'Maximum liver SOFA2 
 COMMENT ON COLUMN mimiciv_derived.first_day_sofa2.kidney IS 'Maximum kidney SOFA2 score in first 24 hours';
 COMMENT ON COLUMN mimiciv_derived.first_day_sofa2.hemostasis IS 'Maximum hemostasis SOFA2 score in first 24 hours';
 COMMENT ON COLUMN mimiciv_derived.first_day_sofa2.sofa2_total IS
-    'Maximum total SOFA2 score in first 24 hours; primary policy is lab48_rescue_kidney_uorate';
+    'First-day total SOFA2 score: sum of per-organ maxima in first 24 hours; primary policy is lab48_rescue_kidney_uorate';
 COMMENT ON COLUMN mimiciv_derived.first_day_sofa2.sofa2_total_lab48_rescue IS
     'Explicit primary SOFA2 total: platelet/bilirubin lab48_rescue plus official urine_output_rate kidney scoring';
 COMMENT ON COLUMN mimiciv_derived.first_day_sofa2.sofa2_total_strict24 IS
