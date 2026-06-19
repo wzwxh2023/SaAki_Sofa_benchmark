@@ -1,6 +1,6 @@
 # SaAki_Sofa_benchmark
 
-Open-source SOFA-2 implementation and benchmark on **MIMIC-IV v3.1** for ICU sepsis mortality prediction.
+Open-source SOFA-2 SQL implementation on **MIMIC-IV v3.1**.
 
 > To our knowledge, this is the **first publicly available SOFA-2 SQL implementation on MIMIC-IV**.
 
@@ -8,43 +8,28 @@ Open-source SOFA-2 implementation and benchmark on **MIMIC-IV v3.1** for ICU sep
 
 ## Background
 
-SOFA-2 is the second-generation Sequential Organ Failure Assessment score (proposed in *JAMA *, 2025), refining the original SOFA (1996) with:
+SOFA-2 is the second-generation Sequential Organ Failure Assessment score,
+introduced in 2025 as an update to the original SOFA score (1996). SOFA-2
+defines organ-level scoring criteria; it does not prescribe one fixed SQL
+mapping for any specific ICU database.
 
-- Official MIMIC `urine_output_rate` based kidney urine scoring (6h / 12h / 24h)
-- Platelet/bilirubin `lab48_rescue`: strict 24h evidence is used when present; 48h rescue is used only when strict 24h evidence is absent
-- Virtual RRT Cr pathway (does not require urine)
-- Refined cardiovascular scoring for vasoactive support
-- Mechanical support (ECMO) recognition
-- Brain/delirium component (sedation-aware)
-- Explicit scoring rules for missing values
+This repository is the MIMIC-IV v3.1 implementation layer. The following are
+database-specific implementation choices in this SQL pipeline, not claims about
+the wording of the SOFA-2 publication:
+
+- Kidney urine scoring uses the official MIMIC `urine_output_rate` derived table for 6h / 12h / 24h urine-rate evidence
+- Platelet/bilirubin use the `lab48_rescue` policy: strict 24h evidence is used when present; 48h rescue is used only when strict 24h evidence is absent
+- Virtual RRT creatinine criteria are implemented separately from urine-output criteria
+- Cardiovascular scoring maps MIMIC vasoactive support fields to SOFA-2 dose thresholds
+- Mechanical support and ECMO sources are mapped from available MIMIC procedure and charted-event data
+- Brain scoring includes the local sedation-aware GCS and delirium-medication logic used in this pipeline
+- Missing-value handling is made explicit in SQL and documented through current and sensitivity score columns
 
 This repository provides:
 
 1. A reproducible **PostgreSQL pipeline** that computes SOFA-2 (and SOFA-1 for reference) on MIMIC-IV v3.1
-2. **Reviewer-response SQL queries** documenting sensitivity analyses for each methodology challenge raised during peer review
-3. A documented **final SOFA-2 policy**: platelet/bilirubin `lab48_rescue` plus kidney scoring from the official MIMIC `urine_output_rate` derived table
-
----
-
-## Publications
-
-- **Letter** (all-ICU cohort, N = 65,366): *Journal of Intensive Care*. 2026;14:32. Full citation on the journal page.
-- **Main article** (under revision at *Clinical Medicine*): Sepsis cohort, N = 30,667 post-patch; modeling cohort N = 29,246 (train/validation 20,597 / 8,649 by admission year 2168)
-
----
-
-## Key Results (post-patch, 2026-04-03)
-
-| Metric | SOFA-2 | SOFA-1 |
-|---|---|---|
-| ICU mortality AUC | **0.779** | 0.755 |
-| Hospital mortality AUC | **0.745** | 0.725 |
-| C-index, 7-day | **0.799** | 0.781 |
-| C-index, 28-day | **0.751** | 0.736 |
-| NRI (ICU) | **0.143** | reference |
-| IDI (ICU) | **0.020** | reference |
-
-SOFA-2 demonstrated **modestly but consistently better** predictive performance than SOFA-1 across mortality endpoints, at the cost of increased data requirements and implementation complexity.
+2. **Audit and sensitivity SQL** documenting implementation decisions and alternative score policies
+3. A documented **current governed SOFA-2 policy**: platelet/bilirubin `lab48_rescue` plus kidney scoring from the official MIMIC `urine_output_rate` derived table
 
 ---
 
@@ -75,7 +60,9 @@ Only the numbered SQL files in `sofa2_sql/` are the current runnable pipeline.
 Files under `sofa2_sql/archive/` are retained for audit/history and should not
 be used as the primary implementation.
 
-R analysis pipeline (Table 1, ROC/DCA, calibration, survival) is maintained locally and may be added in a future release.
+Manuscript-specific analysis scripts, cohort flowcharts, model outputs, and
+performance estimates are intentionally kept outside this repository. This
+repository is the reusable score-construction layer.
 
 ---
 
@@ -142,11 +129,20 @@ explicit names:
 
 ## Citing
 
-If you use this code, please cite the letter:
+If you use this code, cite this repository and the relevant SOFA/SOFA-2
+methodology papers. Article-specific cohort sizes and model performance should
+be reported from the analysis repository or manuscript that used this score
+pipeline, not from this infrastructure repository.
 
-> *Journal of Intensive Care*. 2026;14:32 (full citation available on the journal landing page).
+Related validation studies may cite their own cohort definitions, score-policy
+versions, endpoints, and statistical outputs separately.
 
-An expanded methodology article (sepsis cohort) is currently under revision.
+Related publication using this implementation:
+
+> Lin L, Fu Z, Sun H, Wang Y, Zhang S, Bai S, Wen X.
+> Comparative prognostic performance of SOFA-1 and SOFA-2 in patients with
+> sepsis at ICU admission. *Clinical Medicine*. 2026;26(4):100601.
+> doi: [10.1016/j.clinme.2026.100601](https://doi.org/10.1016/j.clinme.2026.100601).
 
 ---
 
@@ -158,8 +154,8 @@ MIT — see [LICENSE](LICENSE).
 
 ## 中文摘要
 
-本仓库提供在 MIMIC-IV v3.1 上实现 **SOFA-2**（JAMA  2025 提出的新版评分）的完整 PostgreSQL 管线，以及与 SOFA-1 在 ICU 脓毒症死亡率预测上的基准对比。**据我们所知，这是目前公开的第一份 SOFA-2 × MIMIC-IV SQL 实现**。
+本仓库提供在 MIMIC-IV v3.1 上实现 **SOFA-2**（JAMA 2025 提出的新版评分）的完整 PostgreSQL 管线。**据我们所知，这是目前公开的第一份 SOFA-2 × MIMIC-IV SQL 实现**。
 
-主要结论：SOFA-2 在 ICU 和院内死亡率预测上**一致但幅度有限地优于** SOFA-1（AUC 差异 0.02 左右；NRI = 0.143）。代价是计算复杂度上升（需要小时级 vasoactive 数据、platelet/bilirubin `lab48_rescue`、基于 MIMIC 官方 `urine_output_rate` 的三窗口尿量、ECMO/机械支持识别等）。
+本仓库定位为可复用的评分构建基础工程，不承载某一篇文章的具体 cohort 数字、建模样本量或统计结果。文章级流程图和模型结果应在对应分析项目或手稿中单独维护。
 
-代码包含同行评审阶段（Reviewer #2 对 CV 评分 / dopamine 阈值 / 无尿处理 / 洗脱期等方法学质疑）的完整敏感性分析 SQL，可供后续研究者参考。
+代码包含 SOFA-2 组件构建、版本治理、历史实现归档和敏感性分析 SQL，可供后续研究者复现或审查评分实现。
