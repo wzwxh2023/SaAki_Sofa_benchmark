@@ -159,43 +159,75 @@ cv_sofa AS (
 ),
 
 -- 4. Coagulation (Fix: 使用正确的 Step 2 表名)
+-- Output strict hourly score plus 48h candidate. The final lab48_rescue
+-- decision is made after rolling 24h strict evidence in Step 4.
+-- SOFA-2 hemostasis bands use inclusive cutoffs in the local contract:
+-- <=50 / <=80 / <=100 / <=150.
 coag_sofa AS (
     SELECT 
         co.stay_id, 
         co.hr,
+        cg.platelet_min_strict IS NOT NULL AS platelet_strict_available,
+        cg.platelet_min_lab48 IS NOT NULL AS platelet_lab48_available,
         CASE
-            WHEN cg.platelet_min <= 50  THEN 4 
-            WHEN cg.platelet_min <= 80  THEN 3 
-            WHEN cg.platelet_min <= 100 THEN 2 
-            WHEN cg.platelet_min <= 150 THEN 1 
+            WHEN cg.platelet_min_strict <= 50  THEN 4
+            WHEN cg.platelet_min_strict <= 80  THEN 3
+            WHEN cg.platelet_min_strict <= 100 THEN 2
+            WHEN cg.platelet_min_strict <= 150 THEN 1
+            WHEN cg.platelet_min_strict IS NULL THEN NULL
             ELSE 0
-        END AS coagulation_score
+        END AS coagulation_score,
+        CASE
+            WHEN cg.platelet_min_lab48 <= 50  THEN 4
+            WHEN cg.platelet_min_lab48 <= 80  THEN 3
+            WHEN cg.platelet_min_lab48 <= 100 THEN 2
+            WHEN cg.platelet_min_lab48 <= 150 THEN 1
+            WHEN cg.platelet_min_lab48 IS NULL THEN NULL
+            ELSE 0
+        END AS coagulation_lab48_candidate
     FROM co
     LEFT JOIN mimiciv_derived.sofa2_stage1_coag cg 
         ON co.stay_id = cg.stay_id AND co.hr = cg.hr
 ),
 
 -- 5. Liver
+-- Output strict hourly score plus 48h candidate. The final lab48_rescue
+-- decision is made after rolling 24h strict evidence in Step 4.
 liver_sofa AS (
     SELECT 
         co.stay_id, 
         co.hr,
+        liv.bilirubin_max_strict IS NOT NULL AS bilirubin_strict_available,
+        liv.bilirubin_max_lab48 IS NOT NULL AS bilirubin_lab48_available,
         CASE
-            WHEN liv.bilirubin_max > 12.0 THEN 4
-            WHEN liv.bilirubin_max > 6.0  THEN 3
-            WHEN liv.bilirubin_max > 3.0  THEN 2 
-            WHEN liv.bilirubin_max > 1.2  THEN 1
+            WHEN liv.bilirubin_max_strict > 12.0 THEN 4
+            WHEN liv.bilirubin_max_strict > 6.0  THEN 3
+            WHEN liv.bilirubin_max_strict > 3.0  THEN 2
+            WHEN liv.bilirubin_max_strict > 1.2  THEN 1
+            WHEN liv.bilirubin_max_strict IS NULL THEN NULL
             ELSE 0
-        END AS liver_score
+        END AS liver_score,
+        CASE
+            WHEN liv.bilirubin_max_lab48 > 12.0 THEN 4
+            WHEN liv.bilirubin_max_lab48 > 6.0  THEN 3
+            WHEN liv.bilirubin_max_lab48 > 3.0  THEN 2
+            WHEN liv.bilirubin_max_lab48 > 1.2  THEN 1
+            WHEN liv.bilirubin_max_lab48 IS NULL THEN NULL
+            ELSE 0
+        END AS liver_lab48_candidate
     FROM co
     LEFT JOIN mimiciv_derived.sofa2_stage1_liver liv 
         ON co.stay_id = liv.stay_id AND co.hr = liv.hr
 ),
 
--- 6. Kidney [P0b] 三窗口尿量 + Virtual RRT 修正 + 无尿=0mL
--- 修正来源: PATCH_kidney_three_rate.md (2026-04-03)
--- 改动: (1) 三窗口尿量级联判断 (2) Virtual RRT Cr路径不要求尿量窗口
---        (3) 无尿从 <5mL 改为 =0mL (4) Score 2 在 hr>=24 不再失效
+-- 6. Kidney
+-- Urine source: official mimiciv_derived.urine_output_rate, staged in
+-- sofa2_stage1_urine by hourly charttime alignment. Absence of a uorate row is
+-- treated as missing urine-rate evidence, not as zero urine output.
+-- Boundary policy follows SOFA-2 wording used in this project:
+-- urine output uses strict less-than (<0.3 / <0.5 ml/kg/h), creatinine uses
+-- greater-than thresholds (>1.2 / >2.0 / >3.5 mg/dL), and anuria requires
+-- zero urine with at least 12h observed time.
 kidney_sofa AS (
     SELECT
         co.stay_id,
@@ -207,25 +239,30 @@ kidney_sofa AS (
             WHEN l.creatinine > 1.2
                  AND (l.potassium >= 6.0 OR (l.ph <= 7.2 AND l.bicarbonate <= 12)) THEN 4
             -- Virtual RRT 路径2: 少尿驱动
-            WHEN COALESCE(u.rate_6h, u.rate_12h, u.rate_24h) < 0.3
+            WHEN LEAST(
+                    COALESCE(u.uo_mlkghr_6hr_min, 999999),
+                    COALESCE(u.uo_mlkghr_12hr_min, 999999),
+                    COALESCE(u.uo_mlkghr_24hr_min, 999999)
+                 ) < 0.3
                  AND (l.potassium >= 6.0 OR (l.ph <= 7.2 AND l.bicarbonate <= 12)) THEN 4
 
             -- ========== Score 3: 严重肾功能不全 ==========
             WHEN l.creatinine > 3.5 THEN 3
             -- 24h 窗口极少尿
-            WHEN u.rate_24h < 0.3 THEN 3
-            -- 12h 无尿（严格 0 mL，与 SOFA-2 原文一致）
-            WHEN u.uo_sum_12h = 0 AND u.cnt_12h >= 12 THEN 3
+            WHEN u.uo_mlkghr_24hr_min < 0.3 THEN 3
+            -- 12h 无尿（官方 urine_output_rate: 0 mL 且 observed time >=12h）
+            WHEN u.anuria_12h_official = 1 THEN 3
 
             -- ========== Score 2: 中度 ==========
             WHEN l.creatinine > 2.0 THEN 2
-            -- 12h 窗口少尿（优先查长窗口）
-            WHEN u.rate_12h < 0.5 THEN 2
+            -- 12h 窗口少尿；24h <0.3 已在 score 3 捕获，近期改善时不因
+            -- 24h residual oliguria 强制升到 score 2。
+            WHEN u.uo_mlkghr_12hr_min < 0.5 THEN 2
 
             -- ========== Score 1: 轻度 ==========
             WHEN l.creatinine > 1.2 THEN 1
             -- 6h 窗口少尿（短窗口兜底：刚来的或近期恶化的）
-            WHEN u.rate_6h < 0.5 THEN 1
+            WHEN u.uo_mlkghr_6hr_min < 0.5 THEN 1
 
             ELSE 0
         END AS kidney_score
@@ -241,9 +278,15 @@ SELECT
     COALESCE(br.brain_score, 0) AS brain_score,
     COALESCE(rs.respiratory_score, 0) AS respiratory_score,
     COALESCE(cv.cardiovascular_score, 0) AS cardiovascular_score,
-    COALESCE(lv.liver_score, 0) AS liver_score,
+    lv.liver_score,
+    lv.liver_lab48_candidate,
+    COALESCE(lv.bilirubin_strict_available, false) AS bilirubin_strict_available,
+    COALESCE(lv.bilirubin_lab48_available, false) AS bilirubin_lab48_available,
     COALESCE(kd.kidney_score, 0) AS kidney_score,
-    COALESCE(cg.coagulation_score, 0) AS hemostasis_score -- 注意: 这里列名映射为 hemostasis_score 以匹配 Step 5
+    cg.coagulation_score AS hemostasis_score, -- 注意: 这里列名映射为 hemostasis_score 以匹配 Step 5
+    cg.coagulation_lab48_candidate AS hemostasis_lab48_candidate,
+    COALESCE(cg.platelet_strict_available, false) AS platelet_strict_available,
+    COALESCE(cg.platelet_lab48_available, false) AS platelet_lab48_available
 FROM co
 LEFT JOIN brain_sofa br ON co.stay_id = br.stay_id AND co.hr = br.hr
 LEFT JOIN resp_sofa rs ON co.stay_id = rs.stay_id AND co.hr = rs.hr

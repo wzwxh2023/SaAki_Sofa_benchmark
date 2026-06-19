@@ -20,7 +20,18 @@ SELECT
     MAX(kidney) AS kidney,
     MAX(hemostasis) AS hemostasis,
     -- 取0-23小时内的最高总分
-    MAX(sofa2_total) AS sofa2_total
+    MAX(sofa2_total) AS sofa2_total,
+    MAX(sofa2_total_lab48_rescue) AS sofa2_total_lab48_rescue,
+    MAX(sofa2_total_strict24) AS sofa2_total_strict24,
+    MAX(sofa2_total_full48_exploratory) AS sofa2_total_full48_exploratory,
+    MAX(liver_lab48_rescue) AS liver_lab48_rescue,
+    MAX(liver_strict24) AS liver_strict24,
+    MAX(liver_full48_exploratory) AS liver_full48_exploratory,
+    MAX(hemostasis_lab48_rescue) AS hemostasis_lab48_rescue,
+    MAX(hemostasis_strict24) AS hemostasis_strict24,
+    MAX(hemostasis_full48_exploratory) AS hemostasis_full48_exploratory,
+    BOOL_OR(platelet_lab48_rescue_used) AS platelet_lab48_rescue_used,
+    BOOL_OR(bilirubin_lab48_rescue_used) AS bilirubin_lab48_rescue_used
 FROM mimiciv_derived.sofa2_scores_hr_filtered
 WHERE hr BETWEEN 0 AND 23  -- ICU入院后24小时（0-23小时）
 GROUP BY stay_id, subject_id, hadm_id;
@@ -39,4 +50,11 @@ COMMENT ON COLUMN mimiciv_derived.first_day_sofa2.cardiovascular IS 'Maximum car
 COMMENT ON COLUMN mimiciv_derived.first_day_sofa2.liver IS 'Maximum liver SOFA2 score in first 24 hours';
 COMMENT ON COLUMN mimiciv_derived.first_day_sofa2.kidney IS 'Maximum kidney SOFA2 score in first 24 hours';
 COMMENT ON COLUMN mimiciv_derived.first_day_sofa2.hemostasis IS 'Maximum hemostasis SOFA2 score in first 24 hours';
-COMMENT ON COLUMN mimiciv_derived.first_day_sofa2.sofa2_total IS 'Maximum total SOFA2 score in first 24 hours';
+COMMENT ON COLUMN mimiciv_derived.first_day_sofa2.sofa2_total IS
+    'Maximum total SOFA2 score in first 24 hours; primary policy is lab48_rescue_kidney_uorate';
+COMMENT ON COLUMN mimiciv_derived.first_day_sofa2.sofa2_total_lab48_rescue IS
+    'Explicit primary SOFA2 total: platelet/bilirubin lab48_rescue plus official urine_output_rate kidney scoring';
+COMMENT ON COLUMN mimiciv_derived.first_day_sofa2.sofa2_total_strict24 IS
+    'SOFA2 sensitivity total using strict 24h platelet/bilirubin evidence only';
+COMMENT ON COLUMN mimiciv_derived.first_day_sofa2.sofa2_total_full48_exploratory IS
+    'SOFA2 exploratory total using unconditional 48h platelet/bilirubin lookback';

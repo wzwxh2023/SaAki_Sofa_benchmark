@@ -417,117 +417,50 @@ CREATE INDEX idx_st1_rrt ON mimiciv_derived.sofa2_stage1_rrt(stay_id, hr);
 
 
 -- =================================================================
--- 2.11 尿量滑动窗口 (Urine Windows - Dynamic Rate)
--- 优化:
--- 1. 体重三级兜底 (Admission -> First Day -> Avg)
--- 2. COUNT(*) 动态分母解决短住院问题
+-- 2.11 尿量速率 (Urine Output Rate)
+-- Source: official MIMIC derived table mimiciv_derived.urine_output_rate.
+-- Rationale: do not rebuild urine-output rates from sparse raw events on a
+-- fixed ICU hourly grid. The official derived table carries observed-time
+-- denominators (uo_tm_6hr/12hr/24hr) and normalized rates.
 -- =================================================================
 DROP TABLE IF EXISTS mimiciv_derived.sofa2_stage1_urine;
 CREATE UNLOGGED TABLE mimiciv_derived.sofa2_stage1_urine AS
-
--- 1. 准备体重
-WITH weight_avg_whole_stay AS (
-    SELECT stay_id, AVG(weight) as weight_full_avg
-    FROM mimiciv_derived.weight_durations
-    WHERE weight > 0
-    GROUP BY stay_id
-),
--- 第4级：从chartevents获取体重（处理单位转换）
-weight_from_ce AS (
-    SELECT 
-        stay_id, 
-        AVG(
-            CASE 
-                WHEN itemid = 226531 THEN valuenum * 0.453592  -- lbs → kg
-                ELSE valuenum                                   -- 已经是kg
-            END
-        ) as weight_ce
-    FROM mimiciv_icu.chartevents
-    WHERE itemid IN (224639, 226512, 226531)
-      AND valuenum > 0 
-      AND (
-          (itemid IN (224639, 226512) AND valuenum BETWEEN 20 AND 300)
-          OR 
-          (itemid = 226531 AND valuenum BETWEEN 44 AND 660)
-      )
-    GROUP BY stay_id
-),
--- 五级兜底：整合所有来源
-weight_final AS (
-    SELECT 
-        ie.stay_id,
-        COALESCE(
-            fd.weight_admit,                    -- 1. 入院体重
-            fd.weight,                          -- 2. 首日均值
-            ws.weight_full_avg,                 -- 3. 全程均值
-            ce.weight_ce,                       -- 4. chartevents原始
-            CASE WHEN p.gender = 'F' THEN 70.0  -- 5. 性别中位数（女）
-                 ELSE 83.3                      -- 5. 性别中位数（男）
-            END
-        ) AS weight
-    FROM mimiciv_icu.icustays ie
-    JOIN mimiciv_hosp.patients p ON ie.subject_id = p.subject_id
-    LEFT JOIN mimiciv_derived.first_day_weight fd ON ie.stay_id = fd.stay_id
-    LEFT JOIN weight_avg_whole_stay ws ON ie.stay_id = ws.stay_id
-    LEFT JOIN weight_from_ce ce ON ie.stay_id = ce.stay_id
-),
-
--- 2. 准备网格数据
-uo_grid AS (
-    SELECT 
-        ih.stay_id, 
-        ih.hr,
-        ih.endtime,
-        SUM(uo.urineoutput) AS uo_vol_hourly
-    FROM mimiciv_derived.icustay_hourly_basedon_icuintime ih
-    LEFT JOIN mimiciv_derived.urine_output uo 
-           ON ih.stay_id = uo.stay_id 
-           AND uo.charttime > ih.endtime - INTERVAL '1 HOUR' 
-           AND uo.charttime <= ih.endtime
-    WHERE ih.hr >= -24
-    GROUP BY ih.stay_id, ih.hr, ih.endtime
-)
-
--- 3. 计算滑动窗口
 SELECT
-    g.stay_id,
-    g.hr,
-    w.weight,
-
-    SUM(uo_vol_hourly) OVER w6 AS uo_sum_6h,
-    SUM(uo_vol_hourly) OVER w12 AS uo_sum_12h,
-    SUM(uo_vol_hourly) OVER w24 AS uo_sum_24h,
-
-    COUNT(*) OVER w6 AS cnt_6h,
-    COUNT(*) OVER w12 AS cnt_12h,
-    COUNT(*) OVER w24 AS cnt_24h,
-
-    -- 三窗口尿量速率 (ml/kg/h): 同时输出，评分时级联判断
-    -- [P0a] 修正: 原 urine_rate_ml_kg_h 只存最长窗口，长期患者近期少尿被稀释
-    CASE WHEN g.hr >= 6  AND w.weight > 0
-         THEN SUM(uo_vol_hourly) OVER w6  / w.weight / 6
-    END AS rate_6h,
-
-    CASE WHEN g.hr >= 12 AND w.weight > 0
-         THEN SUM(uo_vol_hourly) OVER w12 / w.weight / 12
-    END AS rate_12h,
-
-    CASE WHEN g.hr >= 24 AND w.weight > 0
-         THEN SUM(uo_vol_hourly) OVER w24 / w.weight / 24
-    END AS rate_24h
-
-FROM uo_grid g
-JOIN weight_final w ON g.stay_id = w.stay_id
-WINDOW
-    w6  AS (PARTITION BY g.stay_id ORDER BY g.hr ROWS BETWEEN 5 PRECEDING AND CURRENT ROW),
-    w12 AS (PARTITION BY g.stay_id ORDER BY g.hr ROWS BETWEEN 11 PRECEDING AND CURRENT ROW),
-    w24 AS (PARTITION BY g.stay_id ORDER BY g.hr ROWS BETWEEN 23 PRECEDING AND CURRENT ROW);
+    ih.stay_id,
+    ih.hr,
+    MIN(uor.weight) AS weight,
+    MIN(uor.urineoutput_6hr) AS urineoutput_6hr,
+    MIN(uor.urineoutput_12hr) AS urineoutput_12hr,
+    MIN(uor.urineoutput_24hr) AS urineoutput_24hr,
+    MIN(uor.uo_tm_6hr) AS uo_tm_6hr_min,
+    MIN(uor.uo_tm_12hr) AS uo_tm_12hr_min,
+    MIN(uor.uo_tm_24hr) AS uo_tm_24hr_min,
+    -- If multiple urine_output_rate rows fall in one ICU hour, keep the worst
+    -- observed rolling rate. This follows SOFA's worst-value scoring convention.
+    MIN(uor.uo_mlkghr_6hr) AS uo_mlkghr_6hr_min,
+    MIN(uor.uo_mlkghr_12hr) AS uo_mlkghr_12hr_min,
+    MIN(uor.uo_mlkghr_24hr) AS uo_mlkghr_24hr_min,
+    MAX(CASE
+        WHEN uor.urineoutput_12hr = 0 AND uor.uo_tm_12hr >= 12 THEN 1
+        ELSE 0
+    END) AS anuria_12h_official,
+    COUNT(uor.charttime) AS uor_events_in_hour
+FROM mimiciv_derived.icustay_hourly_basedon_icuintime ih
+LEFT JOIN mimiciv_derived.urine_output_rate uor
+    ON ih.stay_id = uor.stay_id
+    AND uor.charttime > ih.endtime - INTERVAL '1 HOUR'
+    AND uor.charttime <= ih.endtime
+WHERE ih.hr >= -24
+GROUP BY ih.stay_id, ih.hr;
 
 CREATE INDEX idx_st1_urine ON mimiciv_derived.sofa2_stage1_urine(stay_id, hr);
 
 -- -----------------------------------------------------------------
 -- 2.12 凝血系统 (Coagulation)
-
+-- Policy:
+--   - strict: current ICU hour only, used as the SOFA-2 definition anchor
+--   - lab48: previous 48h, used only later as rescue when the rolling strict
+--     24h window has no platelet evidence
 -- -----------------------------------------------------------------
 DROP TABLE IF EXISTS mimiciv_derived.sofa2_stage1_coag;
 CREATE UNLOGGED TABLE mimiciv_derived.sofa2_stage1_coag AS
@@ -541,7 +474,11 @@ WITH plt_raw AS (
 SELECT 
     ih.stay_id, 
     ih.hr,
-    MIN(p.platelet) AS platelet_min
+    MIN(p.platelet) FILTER (
+        WHERE p.charttime > ih.endtime - INTERVAL '1 HOUR'
+          AND p.charttime <= ih.endtime
+    ) AS platelet_min_strict,
+    MIN(p.platelet) AS platelet_min_lab48
 FROM mimiciv_derived.icustay_hourly_basedon_icuintime ih
 JOIN mimiciv_icu.icustays ie ON ih.stay_id = ie.stay_id
 LEFT JOIN plt_raw p 
@@ -557,7 +494,10 @@ CREATE INDEX idx_st1_coag ON mimiciv_derived.sofa2_stage1_coag(stay_id, hr);
 -- -----------------------------------------------------------------
 -- 2.13 肝脏系统 (Liver)
 -- 数据源: mimiciv_derived.enzyme (确认包含 bilirubin_total)
--- 逻辑: 取过去 48 小时内最高的总胆红素 (Bilirubin)
+-- Policy:
+--   - strict: current ICU hour only, used as the SOFA-2 definition anchor
+--   - lab48: previous 48h, used only later as rescue when the rolling strict
+--     24h window has no bilirubin evidence
 -- -----------------------------------------------------------------
 DROP TABLE IF EXISTS mimiciv_derived.sofa2_stage1_liver;
 CREATE UNLOGGED TABLE mimiciv_derived.sofa2_stage1_liver AS
@@ -571,7 +511,11 @@ WITH bili_raw AS (
 SELECT 
     ih.stay_id, 
     ih.hr,
-    MAX(b.bilirubin_total) AS bilirubin_max
+    MAX(b.bilirubin_total) FILTER (
+        WHERE b.charttime > ih.endtime - INTERVAL '1 HOUR'
+          AND b.charttime <= ih.endtime
+    ) AS bilirubin_max_strict,
+    MAX(b.bilirubin_total) AS bilirubin_max_lab48
 FROM mimiciv_derived.icustay_hourly_basedon_icuintime ih
 JOIN mimiciv_icu.icustays ie ON ih.stay_id = ie.stay_id
 LEFT JOIN bili_raw b 

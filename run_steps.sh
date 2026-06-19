@@ -15,6 +15,7 @@ run_step() {
 }
 
 echo "====== 开始运行 SOFA2 提取流程 ======"
+run_step "00_create_icustay_hourly_basedon_icuintime"
 run_step "01_setup_cleanup"
 run_step "02_stage_components"
 run_step "03_hourly_raw_scores"
@@ -23,4 +24,5 @@ run_step "05_filter_hr_nonnegative"
 run_step "06_first_day_sofa2_simple"
 run_step "07_sepsis3_sofa2_delta"
 run_step "08_extract_outcomes_final_corrected"
+run_step "09_update_sepsis3_SOFA1"
 echo "====== 全部步骤完成 ======"

@@ -1,7 +1,8 @@
 -- =================================================================
 -- 步骤 1: 环境配置与清理
 -- =================================================================
--- 注意：请先运行 01_create_icustay_hourly_basedon_icuintime.sql 创建基于ICU入院时间的hourly表
+-- 注意：手动分步执行时，请先运行 00_create_icustay_hourly_basedon_icuintime.sql
+-- 创建基于ICU入院时间的hourly表；run_steps.sh 已包含此前置步骤。
 SET work_mem = '2047MB';
 SET maintenance_work_mem = '2047MB';
 SET max_parallel_workers = 24;
