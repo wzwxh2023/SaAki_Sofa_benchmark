@@ -1,5 +1,5 @@
 -- =================================================================
--- 09: 基于 SOFA 的 Sepsis-3 定义（采用 ΔSOFA 计算方式）
+-- 08: 基于 SOFA-1 的 Sepsis-3 定义（采用 ΔSOFA 计算方式）
 -- 与 sofa2_sql/07_sepsis3_sofa2_delta.sql 逻辑一致，但使用原始 SOFA 评分
 --
 -- 主要改进：
@@ -92,9 +92,7 @@ window_scores AS (
         COALESCE(baseline.baseline_sofa, 0) AS baseline_sofa_filled,
         baseline.baseline_observed,
         s.sofa_score - COALESCE(baseline.baseline_sofa, 0) AS delta_sofa,
-        -- 两种 sepsis 定义方法
-        (s.sofa_score - COALESCE(baseline.baseline_sofa, 0) >= 2 AND soi.suspected_infection = 1) AS sepsis3_sofa_delta,
-        (s.sofa_score >= 2 AND soi.suspected_infection = 1) AS sepsis3_sofa_absolute
+        (s.sofa_score - COALESCE(baseline.baseline_sofa, 0) >= 2 AND soi.suspected_infection = 1) AS sepsis3_sofa1_delta
     FROM soi
     INNER JOIN sofa s
         ON soi.stay_id = s.stay_id
@@ -119,7 +117,7 @@ first_hit AS (
                 ws.sofa_time
         ) AS rn
     FROM window_scores ws
-    WHERE ws.sepsis3_sofa_delta
+    WHERE ws.sepsis3_sofa1_delta
 )
 SELECT
     subject_id,
@@ -141,8 +139,7 @@ SELECT
     cardiovascular,
     cns,
     renal,
-    sepsis3_sofa_delta,
-    sepsis3_sofa_absolute
+    sepsis3_sofa1_delta
 FROM first_hit
 WHERE rn = 1;
 
@@ -153,5 +150,4 @@ COMMENT ON TABLE mimiciv_derived.sepsis3_sofa1_delta IS 'Sepsis-3 onset using or
 COMMENT ON COLUMN mimiciv_derived.sepsis3_sofa1_delta.baseline_sofa IS 'Baseline SOFA score (minimum in 48h before infection)';
 COMMENT ON COLUMN mimiciv_derived.sepsis3_sofa1_delta.baseline_observed IS 'Whether baseline SOFA was observed (true) or imputed as 0 (false)';
 COMMENT ON COLUMN mimiciv_derived.sepsis3_sofa1_delta.delta_sofa IS 'Change in SOFA score from baseline';
-COMMENT ON COLUMN mimiciv_derived.sepsis3_sofa1_delta.sepsis3_sofa_delta IS 'Sepsis-3 defined by ΔSOFA ≥ 2';
-COMMENT ON COLUMN mimiciv_derived.sepsis3_sofa1_delta.sepsis3_sofa_absolute IS 'Sepsis-3 defined by absolute SOFA ≥ 2 (for comparison)';
+COMMENT ON COLUMN mimiciv_derived.sepsis3_sofa1_delta.sepsis3_sofa1_delta IS 'Sepsis-3 defined by SOFA-1 ΔSOFA >= 2';

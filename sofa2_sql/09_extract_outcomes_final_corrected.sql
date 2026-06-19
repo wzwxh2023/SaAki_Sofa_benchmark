@@ -4,6 +4,44 @@
 -- 计算分开的通气时长
 -- =================================================================
 
+-- Build the current governed sepsis definition table before outcomes.
+-- One row per ICU stay; downstream analyses should use explicit flags instead
+-- of ambiguous legacy sepsis labels.
+DROP TABLE IF EXISTS mimiciv_derived.sepsis3_definitions_current CASCADE;
+
+CREATE TABLE mimiciv_derived.sepsis3_definitions_current AS
+SELECT
+    icu.subject_id,
+    icu.hadm_id,
+    icu.stay_id,
+    CASE WHEN off.sepsis3 = true THEN 1 ELSE 0 END AS sepsis3_sofa1_official_absolute,
+    CASE WHEN s1.sepsis3_sofa1_delta = true THEN 1 ELSE 0 END AS sepsis3_sofa1_delta,
+    CASE WHEN s2.sepsis3_sofa2_delta = true THEN 1 ELSE 0 END AS sepsis3_sofa2_delta,
+    CASE
+        WHEN COALESCE(s1.sepsis3_sofa1_delta, false)
+          OR COALESCE(s2.sepsis3_sofa2_delta, false)
+        THEN 1 ELSE 0
+    END AS sepsis3_primary_delta_any,
+    'sofa1_delta_or_sofa2_delta'::text AS sepsis3_primary_policy,
+    s1.baseline_sofa AS sepsis3_sofa1_baseline,
+    s1.delta_sofa AS sepsis3_sofa1_delta_value,
+    s2.baseline_sofa2 AS sepsis3_sofa2_baseline,
+    s2.delta_sofa2 AS sepsis3_sofa2_delta_value
+FROM mimiciv_icu.icustays icu
+LEFT JOIN mimiciv_derived.sepsis3 off ON icu.stay_id = off.stay_id
+LEFT JOIN mimiciv_derived.sepsis3_sofa1_delta s1 ON icu.stay_id = s1.stay_id
+LEFT JOIN mimiciv_derived.sepsis3_sofa2_delta s2 ON icu.stay_id = s2.stay_id;
+
+CREATE INDEX idx_sepsis3_definitions_current_stay ON mimiciv_derived.sepsis3_definitions_current(stay_id);
+CREATE INDEX idx_sepsis3_definitions_current_subject ON mimiciv_derived.sepsis3_definitions_current(subject_id);
+CREATE INDEX idx_sepsis3_definitions_current_primary ON mimiciv_derived.sepsis3_definitions_current(sepsis3_primary_delta_any);
+
+COMMENT ON TABLE mimiciv_derived.sepsis3_definitions_current IS 'Current governed sepsis definitions: official SOFA-1 absolute comparator, SOFA-1 delta, SOFA-2 delta, and primary delta-any policy';
+COMMENT ON COLUMN mimiciv_derived.sepsis3_definitions_current.sepsis3_sofa1_official_absolute IS 'Official MIMIC sepsis3 definition: SOFA-1 >= 2 with baseline assumed 0';
+COMMENT ON COLUMN mimiciv_derived.sepsis3_definitions_current.sepsis3_sofa1_delta IS 'SOFA-1 explicit delta definition: SOFA-1 change >= 2 from pre-infection baseline';
+COMMENT ON COLUMN mimiciv_derived.sepsis3_definitions_current.sepsis3_sofa2_delta IS 'SOFA-2 explicit delta definition: SOFA-2 change >= 2 from pre-infection baseline';
+COMMENT ON COLUMN mimiciv_derived.sepsis3_definitions_current.sepsis3_primary_delta_any IS 'Primary benchmark cohort flag: sepsis3_sofa1_delta OR sepsis3_sofa2_delta';
+
 -- 删除已存在的表
 DROP TABLE IF EXISTS mimiciv_derived.patient_outcomes CASCADE;
 
@@ -304,19 +342,19 @@ rrt_info AS (
     GROUP BY r.stay_id
 ),
 
--- Sepsis信息
-sepsis_info AS (
+sepsis_definitions AS (
     SELECT
         stay_id,
-        sepsis3
-    FROM mimiciv_derived.sepsis3
-),
-
-sepsis2_info AS (
-    SELECT
-        stay_id,
-        sepsis3_sofa2
-    FROM mimiciv_derived.sepsis3_sofa2_delta
+        sepsis3_sofa1_official_absolute,
+        sepsis3_sofa1_delta,
+        sepsis3_sofa2_delta,
+        sepsis3_primary_delta_any,
+        sepsis3_primary_policy,
+        sepsis3_sofa1_baseline,
+        sepsis3_sofa1_delta_value,
+        sepsis3_sofa2_baseline,
+        sepsis3_sofa2_delta_value
+    FROM mimiciv_derived.sepsis3_definitions_current
 )
 
 -- 主查询：组合所有结局变量
@@ -418,9 +456,16 @@ SELECT
     sofa2.brain AS sofa2_brain,
     sofa2.kidney AS sofa2_kidney,
 
-    -- Sepsis诊断
-    CASE WHEN sep.sepsis3 = true THEN 1 ELSE 0 END AS sepsis3_sofa,
-    CASE WHEN sep2.sepsis3_sofa2 = true THEN 1 ELSE 0 END AS sepsis3_sofa2,
+    -- Sepsis definitions: explicit naming to prevent downstream cohort ambiguity
+    COALESCE(sep.sepsis3_sofa1_official_absolute, 0) AS sepsis3_sofa1_official_absolute,
+    COALESCE(sep.sepsis3_sofa1_delta, 0) AS sepsis3_sofa1_delta,
+    COALESCE(sep.sepsis3_sofa2_delta, 0) AS sepsis3_sofa2_delta,
+    COALESCE(sep.sepsis3_primary_delta_any, 0) AS sepsis3_primary_delta_any,
+    sep.sepsis3_primary_policy,
+    sep.sepsis3_sofa1_baseline,
+    sep.sepsis3_sofa1_delta_value,
+    sep.sepsis3_sofa2_baseline,
+    sep.sepsis3_sofa2_delta_value,
 
     -- 机械通气结局（四分类系统）
     COALESCE(vent.invasive_vent, 0) AS invasive_ventilation,
@@ -463,8 +508,7 @@ LEFT JOIN hosp_info adm ON icu.hadm_id = adm.hadm_id
 LEFT JOIN patient_info pt ON icu.subject_id = pt.subject_id
 LEFT JOIN sofa_info sofa ON icu.stay_id = sofa.stay_id
 LEFT JOIN sofa2_info sofa2 ON icu.stay_id = sofa2.stay_id
-LEFT JOIN sepsis_info sep ON icu.stay_id = sep.stay_id
-LEFT JOIN sepsis2_info sep2 ON icu.stay_id = sep2.stay_id
+LEFT JOIN sepsis_definitions sep ON icu.stay_id = sep.stay_id
 LEFT JOIN ventilation_info vent ON icu.stay_id = vent.stay_id
 LEFT JOIN vasoactive_info vaso ON icu.stay_id = vaso.stay_id
 LEFT JOIN rrt_info rrt ON icu.stay_id = rrt.stay_id
@@ -476,18 +520,23 @@ CREATE INDEX idx_patient_outcomes_current_stay ON mimiciv_derived.patient_outcom
 CREATE INDEX idx_patient_outcomes_current_hadm ON mimiciv_derived.patient_outcomes(hadm_id);
 CREATE INDEX idx_patient_outcomes_current_mortality ON mimiciv_derived.patient_outcomes(hospital_mortality);
 CREATE INDEX idx_patient_outcomes_current_icu_mortality ON mimiciv_derived.patient_outcomes(icu_mortality);
-CREATE INDEX idx_patient_outcomes_current_sepsis ON mimiciv_derived.patient_outcomes(sepsis3_sofa2);
+CREATE INDEX idx_patient_outcomes_current_sepsis_primary ON mimiciv_derived.patient_outcomes(sepsis3_primary_delta_any);
 CREATE INDEX idx_patient_outcomes_current_invasive_vent ON mimiciv_derived.patient_outcomes(invasive_ventilation);
 CREATE INDEX idx_patient_outcomes_current_rrt ON mimiciv_derived.patient_outcomes(rrt_required);
 
 -- 添加表注释
 COMMENT ON TABLE mimiciv_derived.patient_outcomes IS 'Comprehensive patient outcomes including SOFA/SOFA2 scores, mortality, ventilation (4-category), RRT, and survival times';
+COMMENT ON COLUMN mimiciv_derived.patient_outcomes.sepsis3_sofa1_official_absolute IS 'Official MIMIC sepsis3 definition: SOFA-1 >= 2 with baseline assumed 0';
+COMMENT ON COLUMN mimiciv_derived.patient_outcomes.sepsis3_sofa1_delta IS 'SOFA-1 explicit delta definition: SOFA-1 change >= 2 from pre-infection baseline';
+COMMENT ON COLUMN mimiciv_derived.patient_outcomes.sepsis3_sofa2_delta IS 'SOFA-2 explicit delta definition: SOFA-2 change >= 2 from pre-infection baseline';
+COMMENT ON COLUMN mimiciv_derived.patient_outcomes.sepsis3_primary_delta_any IS 'Primary benchmark cohort flag: sepsis3_sofa1_delta OR sepsis3_sofa2_delta';
 
 -- 数据验证查询
 -- SELECT
 --     COUNT(*) AS total_records,
 --     COUNT(CASE WHEN sofa_score > 0 THEN 1 END) AS has_sofa,
 --     COUNT(CASE WHEN sofa2_score > 0 THEN 1 END) AS has_sofa2,
+--     COUNT(CASE WHEN sepsis3_primary_delta_any = 1 THEN 1 END) AS sepsis3_primary_delta_any,
 --     COUNT(CASE WHEN invasive_ventilation = 1 THEN 1 END) AS has_invasive_vent,
 --     COUNT(CASE WHEN noninvasive_ventilation = 1 THEN 1 END) AS has_noninvasive_vent,
 --     COUNT(CASE WHEN hfnc_ventilation = 1 THEN 1 END) AS has_hfnc,

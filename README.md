@@ -61,8 +61,8 @@ sofa2_sql/                    Core PostgreSQL pipeline
 ├── 05_filter_hr_nonnegative.sql
 ├── 06_first_day_sofa2_simple.sql
 ├── 07_sepsis3_sofa2_delta.sql
-├── 08_extract_outcomes_final_corrected.sql
-├── 09_update_sepsis3_SOFA1.sql
+├── 08_sepsis3_sofa1_delta.sql
+├── 09_extract_outcomes_final_corrected.sql
 └── archive/                  Historical patches, reviewer checks, and legacy validation SQL
 
 run_steps.sh                  Shell driver running the current SQL pipeline sequentially
@@ -116,6 +116,27 @@ For platelet and bilirubin, the SQL stages both strict current-hour evidence and
 - `sofa2_total_full48_exploratory`: unconditional 48h platelet/bilirubin exploratory comparator
 
 `sofa2_sql/archive/2026-06-18_legacy_kidney_patch/PATCH_kidney_three_rate.md` is retained as the historical record of the earlier fixed-grid three-window patch. The official `urine_output_rate` path supersedes that fixed-grid reconstruction for the main implementation.
+
+### Sepsis definition governance
+
+The primary sepsis cohort policy is explicit:
+
+```text
+sepsis3_primary_delta_any = sepsis3_sofa1_delta OR sepsis3_sofa2_delta
+```
+
+`mimiciv_derived.sepsis3` is retained as the official MIMIC comparator
+(`sepsis3_sofa1_official_absolute`: SOFA-1 >= 2 with baseline assumed 0), but
+it is not the primary cohort flag. `09_extract_outcomes_final_corrected.sql`
+first materializes `mimiciv_derived.sepsis3_definitions_current` and then
+exports the same definitions into `mimiciv_derived.patient_outcomes` with
+explicit names:
+
+- `sepsis3_sofa1_official_absolute`
+- `sepsis3_sofa1_delta`
+- `sepsis3_sofa2_delta`
+- `sepsis3_primary_delta_any`
+- `sepsis3_primary_policy`
 
 ---
 

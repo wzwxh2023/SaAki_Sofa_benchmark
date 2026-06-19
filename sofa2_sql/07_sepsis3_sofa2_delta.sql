@@ -85,7 +85,7 @@ window_scores AS (
         COALESCE(baseline.baseline_sofa2, 0) AS baseline_sofa2_filled,
         baseline.baseline_observed,
         s2.sofa2_score - COALESCE(baseline.baseline_sofa2, 0) AS delta_sofa2,
-        (s2.sofa2_score - COALESCE(baseline.baseline_sofa2, 0) >= 2 AND soi.suspected_infection = 1) AS sepsis3_sofa2
+        (s2.sofa2_score - COALESCE(baseline.baseline_sofa2, 0) >= 2 AND soi.suspected_infection = 1) AS sepsis3_sofa2_delta
     FROM soi
     INNER JOIN sofa2 s2
         ON soi.stay_id = s2.stay_id
@@ -109,7 +109,7 @@ first_hit AS (
                 ws.sofa_time
         ) AS rn
     FROM window_scores ws
-    WHERE ws.sepsis3_sofa2
+    WHERE ws.sepsis3_sofa2_delta
 )
 SELECT
     subject_id,
@@ -131,8 +131,9 @@ SELECT
     liver,
     kidney,
     hemostasis,
-    sepsis3_sofa2
+    sepsis3_sofa2_delta
 FROM first_hit
 WHERE rn = 1;
 
 COMMENT ON TABLE mimiciv_derived.sepsis3_sofa2_delta IS 'Sepsis-3 onset using SOFA2 with explicit ΔSOFA2 (baseline=48h pre-infection min, fallback 0)';
+COMMENT ON COLUMN mimiciv_derived.sepsis3_sofa2_delta.sepsis3_sofa2_delta IS 'Sepsis-3 defined by SOFA2 ΔSOFA >= 2';

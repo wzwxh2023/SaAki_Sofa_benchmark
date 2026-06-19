@@ -10,7 +10,7 @@ run_step() {
   local step="$1"
   echo "----------------------------------------"
   echo "[$(date '+%F %T')] 开始执行 ${step}"
-  psql -h "${DB_HOST}" -U "${DB_USER}" -d "${DB_NAME}" -f "sofa2_sql/${step}.sql"
+  psql -h "${DB_HOST}" -U "${DB_USER}" -d "${DB_NAME}" -v ON_ERROR_STOP=1 -f "sofa2_sql/${step}.sql"
   echo "[$(date '+%F %T')] 完成 ${step}"
 }
 
@@ -23,6 +23,6 @@ run_step "04_window_final_scores"
 run_step "05_filter_hr_nonnegative"
 run_step "06_first_day_sofa2_simple"
 run_step "07_sepsis3_sofa2_delta"
-run_step "08_extract_outcomes_final_corrected"
-run_step "09_update_sepsis3_SOFA1"
+run_step "08_sepsis3_sofa1_delta"
+run_step "09_extract_outcomes_final_corrected"
 echo "====== 全部步骤完成 ======"
