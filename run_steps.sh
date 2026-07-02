@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-unset PGPASSWORD   # 走 ~/.pgpass 自动认证；防环境变量泄露凭证
-DB_HOST="172.19.160.1"
-DB_USER="postgres"
-DB_NAME="mimiciv_31"
+unset PGPASSWORD   # Use ~/.pgpass authentication; do not pass credentials here.
+DB_HOST="${DB_HOST:-localhost}"
+DB_USER="${DB_USER:-postgres}"
+DB_NAME="${DB_NAME:-mimiciv}"
 
 run_step() {
   local step="$1"

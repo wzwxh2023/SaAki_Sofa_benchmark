@@ -31,6 +31,11 @@ This repository provides:
 2. **Audit and sensitivity SQL** documenting implementation decisions and alternative score policies
 3. A documented **current governed SOFA-2 policy**: platelet/bilirubin `lab48_rescue` plus kidney scoring from the official MIMIC `urine_output_rate` derived table
 
+This repository contains code and documentation only. It does not distribute
+MIMIC-IV row-level data, derived patient-level exports, clinical notes, model
+outputs, or manuscript-specific result files. Users must obtain their own
+credentialed access to MIMIC-IV through PhysioNet before running the SQL.
+
 ---
 
 ## Repository Structure
@@ -47,18 +52,14 @@ sofa2_sql/                    Core PostgreSQL pipeline
 ├── 06_first_day_sofa2_simple.sql
 ├── 07_sepsis3_sofa2_delta.sql
 ├── 08_sepsis3_sofa1_delta.sql
-├── 09_extract_outcomes_final_corrected.sql
-└── archive/                  Historical patches, reviewer checks, and legacy validation SQL
+└── 09_extract_outcomes_final_corrected.sql
 
 run_steps.sh                  Shell driver running the current SQL pipeline sequentially
 tests/                        Static guardrails for the current public SQL
-utils/db_helper.py            Python helper for ad-hoc queries
 LICENSE                       MIT
 ```
 
 Only the numbered SQL files in `sofa2_sql/` are the current runnable pipeline.
-Files under `sofa2_sql/archive/` are retained for audit/history and should not
-be used as the primary implementation.
 
 Manuscript-specific analysis scripts, cohort flowcharts, model outputs, and
 performance estimates are intentionally kept outside this repository. This
@@ -79,12 +80,13 @@ repository is the reusable score-construction layer.
    <host>:<port>:*:<user>:<password>
    ```
 
-3. Python 3.10+ with `psycopg2`, `sqlalchemy`, `pandas` (for `utils/db_helper.py` only)
-
 ### Run the pipeline
 
 ```bash
 cd /path/to/SaAki_Sofa_benchmark
+export DB_HOST=localhost
+export DB_USER=postgres
+export DB_NAME=mimiciv
 bash run_steps.sh
 ```
 
@@ -113,8 +115,6 @@ For platelet and bilirubin, the SQL stages both strict current-hour evidence and
 - `sofa2_total_lab48_rescue`: primary/default policy
 - `sofa2_total_strict24`: strict 24h platelet/bilirubin sensitivity
 - `sofa2_total_full48_exploratory`: unconditional 48h platelet/bilirubin exploratory comparator
-
-`sofa2_sql/archive/2026-06-18_legacy_kidney_patch/PATCH_kidney_three_rate.md` is retained as the historical record of the earlier fixed-grid three-window patch. The official `urine_output_rate` path supersedes that fixed-grid reconstruction for the main implementation.
 
 ### Sepsis definition governance
 
@@ -182,4 +182,4 @@ MIT — see [LICENSE](LICENSE).
 
 本仓库提供在 MIMIC-IV v3.1 上实现 **SOFA-2**（JAMA 2025 提出的新版评分）的完整 PostgreSQL 管线。**据我们所知，这是目前公开的第一份 SOFA-2 × MIMIC-IV SQL 实现**。
 
-本仓库定位为可复用的评分构建基础工程，代码包含 SOFA-2 组件构建、版本治理、历史实现归档和敏感性分析 SQL，可供后续研究者复现或审查评分实现。
+本仓库定位为可复用的评分构建基础工程，代码包含 SOFA-2 组件构建、版本治理和敏感性分析 SQL，可供后续研究者复现或审查评分实现。仓库不包含 MIMIC-IV 行级数据、临床文本或论文结果导出文件。

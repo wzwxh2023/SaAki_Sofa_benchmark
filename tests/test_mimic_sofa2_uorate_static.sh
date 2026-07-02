@@ -87,9 +87,11 @@ grep -q "Refusing to validate with production schema" "${shadow_validation_sql}"
 grep -q "%I.validation_current_vs_shadow_sofa2_first_day_diff" "${shadow_validation_sql}"
 
 if compgen -G "${repo_root}/sofa2_sql/review_check_*.sql" > /dev/null; then
-  echo "review_check SQL files must stay under sofa2_sql/archive/review_checks" >&2
+  echo "review_check SQL files must not be published in the runnable pipeline root" >&2
   exit 1
 fi
 
-test -f "${repo_root}/sofa2_sql/archive/README.md"
-test -f "${repo_root}/sofa2_sql/archive/2026-06-18_legacy_kidney_patch/PATCH_kidney_three_rate.md"
+if [[ -d "${repo_root}/sofa2_sql/archive" ]]; then
+  echo "archive artifacts are intentionally excluded from the public score-construction repository" >&2
+  exit 1
+fi

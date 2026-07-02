@@ -3,9 +3,9 @@ set -euo pipefail
 
 unset PGPASSWORD
 
-DB_HOST="${DB_HOST:-172.19.160.1}"
+DB_HOST="${DB_HOST:-localhost}"
 DB_USER="${DB_USER:-postgres}"
-DB_NAME="${DB_NAME:-mimiciv_31}"
+DB_NAME="${DB_NAME:-mimiciv}"
 TARGET_SCHEMA="${TARGET_SCHEMA:-}"
 
 if [[ -z "${TARGET_SCHEMA}" ]]; then
